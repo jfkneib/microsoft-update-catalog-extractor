@@ -86,6 +86,54 @@ Note:
 - ce fichier sert surtout a tester la connexion avec le client MariaDB sans repasser le mot de passe en ligne de commande;
 - une evolution possible consiste a ajouter une option du type --db-defaults-file pour que le script lise aussi ce fichier.
 
+## Exemples base MySQL ou MariaDB
+
+Le script utilise PyMySQL et fonctionne avec un serveur MySQL compatible MariaDB/MySQL.
+
+Creation d'une base de test et d'un utilisateur dedie:
+
+```sql
+CREATE DATABASE xmppmaster CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER 'extraction_test'@'localhost' IDENTIFIED BY 'change_me';
+GRANT ALL PRIVILEGES ON xmppmaster.* TO 'extraction_test'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+Verification de connexion avec le client mysql:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u extraction_test -p -D xmppmaster -e "SELECT 1;"
+```
+
+Verification de connexion avec un fichier .my.cnf:
+
+```bash
+mysql --defaults-file=.my.cnf -D xmppmaster -e "SELECT 1;"
+```
+
+Exemple d'export vers une base MySQL/MariaDB:
+
+```bash
+python3 extraction.py "Windows Security platform" \
+  --filter-product "Windows Security platform" \
+  --output-mariadb \
+  --db-host 127.0.0.1 \
+  --db-port 3306 \
+  --db-user extraction_test \
+  --db-password change_me \
+  --db-name xmppmaster \
+  --db-table extraction_results \
+  --test-db-connection \
+  --no-links
+```
+
+Controle de la table apres export:
+
+```bash
+mysql -h 127.0.0.1 -P 3306 -u extraction_test -p -D xmppmaster -e "SHOW TABLES LIKE 'extraction_results';"
+mysql -h 127.0.0.1 -P 3306 -u extraction_test -p -D xmppmaster -e "SELECT update_id, titre, produit FROM extraction_results LIMIT 5;"
+```
+
 ## Utilisation rapide
 
 1. Donner la requete de recherche en premier argument positionnel.
@@ -330,7 +378,9 @@ Important sur UUID/KB en integration:
 
 - Le jeu de cas stocke un uuid par ligne (vos UUID de reference).
 - La validation reelle interroge le catalogue par KB (ex: KB5079473), puis verifie titre/produit/classification.
-- Cette approche est plus stable dans le temps: l'update_id retourne dans les resultats peut varier, mais le KB reste le pivot fonctionnel.
+- Un meme KB peut correspondre a plusieurs mises a jour selon l'OS, l'architecture ou la variante publiee.
+- L'update_id identifie une mise a jour de facon plus precise qu'un KB et reste l'identifiant de reference le plus fin.
+- Le KB reste utile comme pivot de recherche catalogue, mais il est moins specifique que l'update_id.
 
 ## Exemple pret a l'emploi
 
