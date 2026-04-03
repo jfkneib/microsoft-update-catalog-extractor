@@ -13,6 +13,7 @@ import argparse
 import csv
 import datetime
 import html
+import importlib
 import io
 import json
 import re
@@ -20,23 +21,34 @@ import shutil
 import sys
 import urllib.parse
 import urllib.request
-from typing import Dict, List
+from typing import Any, Dict, List
 
 
 SEARCH_URL = "https://www.catalog.update.microsoft.com/Search.aspx"
 DOWNLOAD_DIALOG_URL = "https://www.catalog.update.microsoft.com/DownloadDialog.aspx"
 DEFAULT_OUTPUT_CSV = "/home/jfk/catalog_windows_security_platform.csv"
 DEFAULT_OUTPUT_JSON = "/home/jfk/catalog_windows_security_platform.json"
+DEFAULT_DB_PORT = 3306
+DB_COLUMNS = [
+    "titre",
+    "produit",
+    "classification",
+    "derniere_mise_a_jour",
+    "version",
+    "taille",
+    "update_id",
+    "lien_telechargement",
+]
 
 
 MANUAL_TEXT = """\
 NOM
-    extraction.py - Extrait des resultats du Microsoft Update Catalog vers CSV
+    extraction.py - Extrait des resultats du Microsoft Update Catalog vers CSV, JSON ou MariaDB
 
 DESCRIPTION
     Cet utilitaire recupere une page de resultats du Microsoft Update Catalog,
     extrait les colonnes utiles, applique des filtres optionnels, puis exporte
-    un fichier CSV.
+    un fichier CSV, JSON ou une table MariaDB.
 
     Colonnes exportees:
         - titre
@@ -137,6 +149,25 @@ SORTIE
     --save-html fichier.html
         Sauvegarde le HTML recupere.
 
+    --output-mariadb
+        Ecrit les resultats dans une table MariaDB au lieu d'un fichier.
+
+    --db-host, --db-port, --db-user, --db-password
+        Parametres de connexion MariaDB.
+
+    --db-name, --db-table
+        Base et table cibles pour l'export MariaDB.
+
+    --db-charset
+        Jeu de caracteres de connexion (defaut: utf8mb4).
+
+    --db-connect-timeout
+        Timeout de connexion en secondes (defaut: 10).
+
+    --test-db-connection
+        Teste la connexion MariaDB. Sans requete, quitte apres le test.
+        Avec une requete, poursuit ensuite l'extraction.
+
 EXEMPLES
     Prerequis pour les exemples:
         lynx doit etre installe.
@@ -199,18 +230,59 @@ EXEMPLES
 
            12) Afficher les 20 premieres lignes du CSV
          column -s, -t < search_filtered.csv | sed -n '1,20p'
+
+                     13) Tester uniquement la connexion MariaDB
+                             python3 extraction.py --output-mariadb --db-host localhost \
+                                 --db-port 3306 --db-user root --db-password secret \
+                                 --db-name catalog --db-table extraction_results \
+                                 --test-db-connection
+
+                     14) Tester la connexion puis lancer l'extraction
+                             python3 extraction.py "Windows Security platform" \
+                                 --filter-product "Windows Security platform" \
+                                 --output-mariadb --db-host localhost --db-port 3306 \
+                                 --db-user root --db-password secret --db-name catalog \
+                                 --db-table extraction_results --test-db-connection --no-links
+
+                     15) Exporter les resultats vers MariaDB
+                             python3 extraction.py "Windows Security platform" \
+                                 --filter-product "Windows Security platform" \
+                                 --output-mariadb --db-host localhost --db-port 3306 \
+                                 --db-user root --db-password secret --db-name catalog \
+                                 --db-table extraction_results --no-links
 """
 
 
 def debug_log(enabled: bool, message: str) -> None:
-    """Affiche un message de debug sur stderr si le mode debug est actif."""
+    """Ecrit un message de debug sur stderr.
+
+    Cette fonction centralise l'affichage des traces de debug pour eviter de
+    disperser des tests sur le flag dans tout le code. Quand le mode debug est
+    desactive, l'appel ne produit aucun effet.
+
+    Args:
+        enabled: Indique si le mode debug est actif.
+        message: Texte a ecrire sur stderr.
+    """
     if enabled:
         print(f"[DEBUG] {message}", file=sys.stderr)
 
 
 def clean_text(raw: str) -> str:
-    """Nettoie un fragment HTML en texte lisible sur une seule ligne."""
-    # Supprime les balises HTML puis normalise les espaces.
+    """Nettoie un fragment HTML pour obtenir un texte exploitable.
+
+    Le HTML recupere depuis le catalogue contient des balises, des entites HTML
+    et souvent des retours a la ligne ou espaces multiples. Cette fonction
+    normalise ce contenu pour produire une valeur simple, stable et facile a
+    comparer dans les filtres comme dans les exports.
+
+    Args:
+        raw: Fragment HTML ou texte brut a normaliser.
+
+    Returns:
+        Une chaine nettoyee, sans balises HTML et avec des espaces normalises.
+    """
+    # Supprime les balises HTML puis normalise les espaces pour obtenir une valeur plate.
     text = re.sub(r"<[^>]+>", "", raw, flags=re.S)
     text = html.unescape(text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -218,11 +290,33 @@ def clean_text(raw: str) -> str:
 
 
 def parse_rows(page_html: str) -> List[Dict[str, str]]:
-    """Extrait les lignes de resultats depuis le HTML de la page catalogue."""
+    """Extrait les lignes de resultats depuis le HTML de la page catalogue.
+
+    Le Microsoft Update Catalog ne fournit pas une API simple pour ces donnees.
+    Le script travaille donc directement sur le HTML source et reconstruit un
+    enregistrement par ligne du tableau de resultats.
+
+    Args:
+        page_html: HTML brut de la page de recherche du catalogue.
+
+    Returns:
+        Une liste de dictionnaires normalises selon les colonnes definies dans
+        l'export final.
+    """
     row_re = re.compile(r'<tr id="([0-9a-f\-]+)_R\d+">(.*?)</tr>', re.S | re.I)
 
     def extract_cell(row_uid: str, col: int, row_html: str) -> str:
-        """Recupere le contenu texte d'une cellule de colonne donnee."""
+        """Recupere et nettoie le contenu d'une cellule pour une colonne donnee.
+
+        Args:
+            row_uid: Identifiant unique de la ligne dans le tableau HTML.
+            col: Numero de colonne a lire.
+            row_html: HTML complet de la ligne en cours de traitement.
+
+        Returns:
+            Le texte nettoye de la cellule, ou une chaine vide si la cellule
+            n'est pas retrouvee.
+        """
         m = re.search(
             rf'id="{re.escape(row_uid)}_C{col}_R\d+"[^>]*>(.*?)</td>',
             row_html,
@@ -234,13 +328,15 @@ def parse_rows(page_html: str) -> List[Dict[str, str]]:
     for match in row_re.finditer(page_html):
         uid = match.group(1)
         row_html = match.group(2)
+
+        # La taille est parfois encapsulee dans un span dedie au lieu de la cellule standard.
         size_m = re.search(
             rf'<span id="{re.escape(uid)}_size">(.*?)</span>',
             row_html,
             re.S | re.I,
         )
 
-        # Construit un enregistrement normalise pour le CSV final.
+        # Construit un enregistrement normalise pour tous les formats de sortie.
         record = {
             "update_id": uid,
             "titre": extract_cell(uid, 1, row_html),
@@ -258,7 +354,19 @@ def parse_rows(page_html: str) -> List[Dict[str, str]]:
 
 
 def fetch_search_html(query: str, timeout: int = 30) -> str:
-    """Telecharge la page de recherche via requete HTTP simple (sans lynx)."""
+    """Telecharge la page de recherche via HTTP direct.
+
+    Cette fonction existe surtout comme alternative simple pour le debug ou des
+    evolutions futures. Le flux principal du script s'appuie sur lynx, car le
+    site renvoie parfois un HTML plus exploitable par ce biais.
+
+    Args:
+        query: Texte recherche dans le catalogue.
+        timeout: Timeout HTTP en secondes.
+
+    Returns:
+        Le HTML de la page de recherche.
+    """
     params = urllib.parse.urlencode({"q": query})
     url = f"{SEARCH_URL}?{params}"
     req = urllib.request.Request(
@@ -271,7 +379,22 @@ def fetch_search_html(query: str, timeout: int = 30) -> str:
 
 
 def fetch_search_html_with_lynx(query: str, timeout: int = 30) -> str:
-    """Telecharge la page de recherche en passant par lynx."""
+    """Telecharge la page de recherche en utilisant lynx.
+
+    Le site Microsoft Update Catalog repond de maniere plus stable pour ce
+    script quand le HTML est recupere via lynx en mode source. Cette fonction
+    encapsule cet appel systeme et remonte une erreur explicite si lynx echoue.
+
+    Args:
+        query: Texte recherche dans le catalogue.
+        timeout: Timeout de l'appel subprocess en secondes.
+
+    Returns:
+        Le HTML brut renvoye par lynx.
+
+    Raises:
+        RuntimeError: Si lynx retourne un code d'erreur.
+    """
     import subprocess
 
     # Lynx permet une extraction plus proche du rendu attendu par le site.
@@ -289,7 +412,19 @@ def fetch_search_html_with_lynx(query: str, timeout: int = 30) -> str:
 
 
 def fetch_download_link(update_id: str, timeout: int = 30) -> str:
-    """Recupere le premier lien de telechargement direct pour une mise a jour."""
+    """Recupere le premier lien de telechargement direct pour une mise a jour.
+
+    Le catalogue expose les liens de telechargement via DownloadDialog.aspx.
+    Cette fonction reproduit la requete attendue puis extrait la premiere URL
+    disponible dans la reponse HTML/JavaScript.
+
+    Args:
+        update_id: UUID de la mise a jour.
+        timeout: Timeout HTTP en secondes.
+
+    Returns:
+        La premiere URL de telechargement trouvee, ou une chaine vide.
+    """
     # Le endpoint DownloadDialog attend une structure JSON dans le formulaire.
     payload = json.dumps(
         [
@@ -335,25 +470,66 @@ def fetch_download_link(update_id: str, timeout: int = 30) -> str:
 
 
 def filter_rows(rows: List[Dict[str, str]], product_name: str) -> List[Dict[str, str]]:
-    """Filtre les lignes dont le champ produit contient un texte (insensible a la casse)."""
+    """Filtre les lignes dont le champ produit contient un texte.
+
+    Args:
+        rows: Lignes candidates a filtrer.
+        product_name: Texte a chercher dans la colonne produit.
+
+    Returns:
+        Les lignes dont le champ produit contient le texte recherche, sans
+        distinction de casse.
+    """
     needle = product_name.strip().lower()
     return [r for r in rows if needle in r.get("produit", "").strip().lower()]
 
 
 def filter_rows_regex(rows: List[Dict[str, str]], pattern: str, field: str = "produit") -> List[Dict[str, str]]:
-    """Filtre les lignes avec une regex appliquee sur un champ donne."""
+    """Filtre les lignes avec une expression reguliere appliquee sur un champ.
+
+    Args:
+        rows: Lignes a examiner.
+        pattern: Expression reguliere a appliquer.
+        field: Nom de la colonne cible.
+
+    Returns:
+        Les lignes dont le champ cible correspond a la regex.
+    """
     regex = re.compile(pattern, re.I)
     return [r for r in rows if regex.search(r.get(field, "") or "")]
 
 
 def filter_rows_uuid(rows: List[Dict[str, str]], uuid_value: str) -> List[Dict[str, str]]:
-    """Filtre les lignes sur un UUID exact (champ update_id)."""
+    """Filtre les lignes sur un UUID exact.
+
+    Args:
+        rows: Lignes a examiner.
+        uuid_value: UUID attendu dans la colonne update_id.
+
+    Returns:
+        Les lignes dont update_id correspond exactement a la valeur demandee,
+        sans distinction de casse.
+    """
     needle = uuid_value.strip().lower()
     return [r for r in rows if (r.get("update_id", "") or "").strip().lower() == needle]
 
 
 def parse_catalog_date(raw_date: str) -> datetime.date:
-    """Convertit une date catalogue en objet date."""
+    """Convertit une date du catalogue en objet date Python.
+
+    Le catalogue retourne des dates dans plusieurs formats selon les pages ou
+    le contexte. Le script accepte ici les deux formats observes et normalise le
+    resultat en objet date pour permettre tri et filtrage.
+
+    Args:
+        raw_date: Date brute lue dans la colonne derniere_mise_a_jour.
+
+    Returns:
+        La date parsee.
+
+    Raises:
+        ValueError: Si la date est vide ou dans un format non supporte.
+    """
     raw = raw_date.strip()
     if not raw:
         raise ValueError("date vide")
@@ -372,12 +548,22 @@ def filter_rows_by_date_range(
     from_date: datetime.date | None = None,
     to_date: datetime.date | None = None,
 ) -> List[Dict[str, str]]:
-    """Conserve les lignes dont la date est comprise dans l'intervalle demande."""
+    """Conserve les lignes dont la date est comprise dans l'intervalle demande.
+
+    Args:
+        rows: Lignes a filtrer.
+        from_date: Borne basse inclusive, ou None.
+        to_date: Borne haute inclusive, ou None.
+
+    Returns:
+        Les lignes dont la date est dans l'intervalle demande.
+    """
     filtered_rows: List[Dict[str, str]] = []
     for row in rows:
         try:
             row_date = parse_catalog_date(row.get("derniere_mise_a_jour", ""))
         except (ValueError, TypeError):
+            # Une date non exploitable ne peut pas etre comparee correctement: la ligne est ignoree.
             continue
 
         if from_date and row_date < from_date:
@@ -390,7 +576,15 @@ def filter_rows_by_date_range(
 
 
 def select_latest_row(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Retourne uniquement la ligne avec la date la plus recente."""
+    """Retourne uniquement la ligne la plus recente.
+
+    Args:
+        rows: Lignes candidates.
+
+    Returns:
+        Une liste contenant zero ou une ligne. Le retour reste une liste pour
+        conserver une interface uniforme avec les autres fonctions de filtrage.
+    """
     dated_rows = []
     for row in rows:
         try:
@@ -408,7 +602,17 @@ def select_latest_row(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 
 def sort_rows_by_date_desc(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Trie les lignes par date decroissante; les dates invalides sont en fin."""
+    """Trie les lignes par date decroissante.
+
+    Les lignes sans date valide sont preservees et placees en fin de resultat
+    afin de ne pas perdre d'information tout en gardant un ordre coherent.
+
+    Args:
+        rows: Lignes a trier.
+
+    Returns:
+        Une nouvelle liste triee par date decroissante.
+    """
     dated_rows: List[tuple[datetime.date, Dict[str, str]]] = []
     undated_rows: List[Dict[str, str]] = []
     for row in rows:
@@ -422,7 +626,14 @@ def sort_rows_by_date_desc(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 
 def enrich_with_links(rows: List[Dict[str, str]]) -> None:
-    """Ajoute un lien de telechargement direct pour chaque ligne."""
+    """Ajoute un lien de telechargement direct a chaque ligne.
+
+    Cette etape effectue un appel supplementaire par mise a jour. Elle est donc
+    potentiellement lente et peut etre desactivee via --no-links.
+
+    Args:
+        rows: Lignes a enrichir. La liste est modifiee en place.
+    """
     for row in rows:
         try:
             row["lien_telechargement"] = fetch_download_link(row["update_id"])
@@ -436,44 +647,67 @@ def enrich_with_links(rows: List[Dict[str, str]]) -> None:
 
 
 def write_csv(rows: List[Dict[str, str]], output_path: str) -> None:
-    """Ecrit les resultats dans un CSV avec un ordre de colonnes stable."""
+    """Ecrit les resultats dans un fichier CSV.
+
+    Args:
+        rows: Lignes a exporter.
+        output_path: Chemin du fichier CSV cible.
+    """
     csv_content = render_csv(rows)
     with open(output_path, "w", newline="", encoding="utf-8") as handle:
         handle.write(csv_content)
 
 
 def render_csv(rows: List[Dict[str, str]]) -> str:
-    """Construit le rendu CSV en texte pour reutilisation (fichier/console)."""
-    fields = [
-        "titre",
-        "produit",
-        "classification",
-        "derniere_mise_a_jour",
-        "version",
-        "taille",
-        "update_id",
-        "lien_telechargement",
-    ]
+    """Construit le rendu CSV en memoire.
+
+    Le rendu texte est partage entre l'ecriture fichier et l'affichage console
+    pour garantir un format identique dans les deux cas.
+
+    Args:
+        rows: Lignes a serialiser.
+
+    Returns:
+        Le contenu CSV complet sous forme de chaine.
+    """
     buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=fields)
+    # L'ordre des colonnes doit rester stable entre CSV, JSON logique et table SQL.
+    writer = csv.DictWriter(buffer, fieldnames=DB_COLUMNS)
     writer.writeheader()
     writer.writerows(rows)
     return buffer.getvalue()
 
 
 def write_json(rows: List[Dict[str, str]], output_path: str) -> None:
-    """Ecrit les resultats dans un JSON lisible (pretty print)."""
+    """Ecrit les resultats dans un fichier JSON formate.
+
+    Args:
+        rows: Lignes a exporter.
+        output_path: Chemin du fichier JSON cible.
+    """
     with open(output_path, "w", encoding="utf-8") as handle:
         handle.write(render_json(rows))
 
 
 def render_json(rows: List[Dict[str, str]]) -> str:
-    """Construit le rendu JSON en texte pour reutilisation (fichier/console)."""
+    """Construit le rendu JSON en memoire.
+
+    Args:
+        rows: Lignes a serialiser.
+
+    Returns:
+        Une chaine JSON pretty-print terminee par un saut de ligne.
+    """
     return json.dumps(rows, ensure_ascii=False, indent=2) + "\n"
 
 
 def print_results(rows: List[Dict[str, str]], as_json: bool) -> None:
-    """Affiche les resultats dans la console au format choisi."""
+    """Affiche les resultats dans la console avec un en-tete lisible.
+
+    Args:
+        rows: Lignes a afficher.
+        as_json: Indique si l'affichage doit etre en JSON ou en CSV.
+    """
     print("--- RESULTATS ---")
     if as_json:
         print(render_json(rows), end="")
@@ -482,7 +716,14 @@ def print_results(rows: List[Dict[str, str]], as_json: bool) -> None:
 
 
 def print_results_raw(rows: List[Dict[str, str]], as_json: bool) -> None:
-    """Affiche uniquement les donnees de resultat, sans texte annexe."""
+    """Affiche uniquement les donnees de resultat, sans texte annexe.
+
+    Ce mode est utile pour composer le script avec d'autres commandes shell.
+
+    Args:
+        rows: Lignes a afficher.
+        as_json: Indique si l'affichage doit etre en JSON ou en CSV.
+    """
     if as_json:
         print(render_json(rows), end="")
     else:
@@ -490,11 +731,261 @@ def print_results_raw(rows: List[Dict[str, str]], as_json: bool) -> None:
 
 
 def write_output(rows: List[Dict[str, str]], as_json: bool, output_path: str) -> None:
-    """Ecrit les resultats au format CSV ou JSON selon les options."""
+    """Route l'export vers le format fichier demande.
+
+    Args:
+        rows: Lignes a exporter.
+        as_json: Indique si la sortie doit etre en JSON, sinon CSV.
+        output_path: Fichier cible.
+    """
     if as_json:
         write_json(rows, output_path)
     else:
         write_csv(rows, output_path)
+
+
+def sanitize_sql_identifier(identifier: str, label: str) -> str:
+    """Valide un identifiant SQL simple.
+
+    Les noms de base et de table ne peuvent pas etre passes comme parametres SQL
+    prepares. Il faut donc les valider explicitement avant de les interpoler.
+
+    Args:
+        identifier: Identifiant SQL propose par l'utilisateur.
+        label: Libelle a reutiliser dans les messages d'erreur.
+
+    Returns:
+        L'identifiant valide tel quel.
+
+    Raises:
+        ValueError: Si l'identifiant ne respecte pas le format autorise.
+    """
+    if not identifier or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier):
+        raise ValueError(f"{label} invalide: utiliser uniquement lettres, chiffres et underscore")
+    return identifier
+
+
+def load_mariadb_client() -> Any:
+    """Charge le module client MariaDB/MySQL requis pour l'export SQL.
+
+    Le chargement est volontairement paresseux pour ne pas imposer la
+    dependance PyMySQL aux utilisateurs qui exportent seulement en CSV/JSON.
+
+    Returns:
+        Le module client importe dynamiquement.
+
+    Raises:
+        RuntimeError: Si le module PyMySQL n'est pas installe.
+    """
+    try:
+        return importlib.import_module("pymysql")
+    except ImportError as exc:
+        raise RuntimeError(
+            "Module Python manquant pour MariaDB: installez PyMySQL (pip install PyMySQL)."
+        ) from exc
+
+
+def build_db_config(args: argparse.Namespace) -> Dict[str, Any]:
+    """Construit et valide la configuration MariaDB a partir des options CLI.
+
+    Args:
+        args: Namespace argparse issu du parsing CLI.
+
+    Returns:
+        Un dictionnaire de configuration pret a etre passe au client MariaDB.
+
+    Raises:
+        ValueError: Si une option obligatoire manque ou si une valeur est invalide.
+    """
+    required_fields = {
+        "db_host": "--db-host",
+        "db_user": "--db-user",
+        "db_password": "--db-password",
+        "db_name": "--db-name",
+        "db_table": "--db-table",
+    }
+    missing_options = [option for attr, option in required_fields.items() if not getattr(args, attr)]
+    if missing_options:
+        raise ValueError(f"Options MariaDB manquantes: {', '.join(missing_options)}")
+
+    if args.db_port <= 0:
+        raise ValueError("Option MariaDB invalide: --db-port doit etre > 0")
+    if args.db_connect_timeout <= 0:
+        raise ValueError("Option MariaDB invalide: --db-connect-timeout doit etre > 0")
+
+    return {
+        "host": args.db_host,
+        "port": args.db_port,
+        "user": args.db_user,
+        "password": args.db_password,
+        "database": sanitize_sql_identifier(args.db_name, "Nom de base"),
+        "table": sanitize_sql_identifier(args.db_table, "Nom de table"),
+        "charset": args.db_charset,
+        "connect_timeout": args.db_connect_timeout,
+    }
+
+
+def connect_to_mariadb(db_config: Dict[str, Any]) -> Any:
+    """Ouvre une connexion MariaDB a partir de la configuration validee.
+
+    Args:
+        db_config: Parametres de connexion deja valides.
+
+    Returns:
+        Une connexion ouverte vers la base cible.
+    """
+    client = load_mariadb_client()
+    return client.connect(
+        host=db_config["host"],
+        port=db_config["port"],
+        user=db_config["user"],
+        password=db_config["password"],
+        database=db_config["database"],
+        charset=db_config["charset"],
+        connect_timeout=db_config["connect_timeout"],
+        autocommit=False,
+    )
+
+
+def test_mariadb_connection(db_config: Dict[str, Any]) -> None:
+    """Teste qu'une connexion MariaDB peut etre etablie.
+
+    Cette fonction verifie a la fois l'ouverture de connexion et l'execution
+    d'une requete triviale, afin d'eviter un faux positif sur une connexion
+    partiellement ouverte ou mal configuree.
+
+    Args:
+        db_config: Parametres de connexion MariaDB.
+    """
+    connection = connect_to_mariadb(db_config)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+    finally:
+        connection.close()
+
+
+def fetch_existing_table_columns(connection: Any, database_name: str, table_name: str) -> List[str]:
+    """Retourne les colonnes d'une table existante dans l'ordre physique.
+
+    Cette verification est utilisee avant destruction/recreation de la table
+    pour s'assurer qu'on ne remplace pas accidentellement une table qui ne fait
+    pas partie du schema d'export de ce script.
+
+    Args:
+        connection: Connexion SQL ouverte.
+        database_name: Nom de la base cible.
+        table_name: Nom de la table cible.
+
+    Returns:
+        La liste ordonnee des colonnes, ou une liste vide si la table n'existe
+        pas.
+    """
+    query = (
+        "SELECT COLUMN_NAME "
+        "FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+        "ORDER BY ORDINAL_POSITION"
+    )
+    with connection.cursor() as cursor:
+        cursor.execute(query, (database_name, table_name))
+        rows = cursor.fetchall()
+    return [row[0] for row in rows]
+
+
+def ensure_replaceable_extraction_table(connection: Any, database_name: str, table_name: str) -> None:
+    """Verifie que la table cible peut etre remplacee sans risque.
+
+    Le comportement voulu est strict: si la table existe deja mais ne correspond
+    pas exactement au schema d'extraction attendu, le script s'arrete avec une
+    erreur au lieu de supprimer une table potentiellement metier.
+
+    Args:
+        connection: Connexion SQL ouverte.
+        database_name: Nom de la base cible.
+        table_name: Nom de la table cible.
+
+    Raises:
+        ValueError: Si la table existe avec un schema different.
+    """
+    existing_columns = fetch_existing_table_columns(connection, database_name, table_name)
+    if not existing_columns:
+        return
+
+    if existing_columns != DB_COLUMNS:
+        raise ValueError(
+            f"La table existante {database_name}.{table_name} ne correspond pas au schema d'extraction attendu"
+        )
+
+
+def recreate_extraction_table(connection: Any, table_name: str) -> None:
+    """Supprime puis recree la table d'extraction avec le schema attendu.
+
+    Args:
+        connection: Connexion SQL ouverte.
+        table_name: Nom de la table a recreer.
+    """
+    create_sql = (
+        f"CREATE TABLE `{table_name}` ("
+        "`titre` TEXT NOT NULL, "
+        "`produit` TEXT NOT NULL, "
+        "`classification` TEXT NOT NULL, "
+        "`derniere_mise_a_jour` VARCHAR(32) NOT NULL, "
+        "`version` VARCHAR(255) NOT NULL, "
+        "`taille` VARCHAR(255) NOT NULL, "
+        "`update_id` VARCHAR(64) NOT NULL, "
+        "`lien_telechargement` TEXT NOT NULL, "
+        "PRIMARY KEY (`update_id`)"
+        ") CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+    )
+    with connection.cursor() as cursor:
+        # La validation prealable du schema permet ici un DROP/CREATE volontaire et controle.
+        cursor.execute(f"DROP TABLE IF EXISTS `{table_name}`")
+        cursor.execute(create_sql)
+
+
+def insert_rows_into_mariadb(connection: Any, table_name: str, rows: List[Dict[str, str]]) -> None:
+    """Insere les resultats d'extraction dans la table MariaDB cible.
+
+    Args:
+        connection: Connexion SQL ouverte.
+        table_name: Nom de la table dans laquelle inserer les lignes.
+        rows: Lignes normalisees a inserer.
+    """
+    insert_sql = (
+        f"INSERT INTO `{table_name}` ("
+        "titre, produit, classification, derniere_mise_a_jour, version, taille, update_id, lien_telechargement"
+        ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+    )
+    # La charge utile respecte exactement l'ordre defini dans DB_COLUMNS et dans le CREATE TABLE.
+    payload = [tuple((row.get(column, "") or "") for column in DB_COLUMNS) for row in rows]
+    with connection.cursor() as cursor:
+        cursor.executemany(insert_sql, payload)
+
+
+def write_output_to_mariadb(rows: List[Dict[str, str]], db_config: Dict[str, Any]) -> None:
+    """Ecrit les resultats dans MariaDB apres validation stricte de la table cible.
+
+    Le flux est volontairement transactionnel: validation du schema, recreation
+    de la table, insertion des lignes, puis commit final. En cas d'erreur, un
+    rollback est tente avant fermeture de la connexion.
+
+    Args:
+        rows: Lignes a inserer.
+        db_config: Configuration de connexion et de destination SQL.
+    """
+    connection = connect_to_mariadb(db_config)
+    try:
+        ensure_replaceable_extraction_table(connection, db_config["database"], db_config["table"])
+        recreate_extraction_table(connection, db_config["table"])
+        insert_rows_into_mariadb(connection, db_config["table"], rows)
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def apply_regex_filter_option(
@@ -505,7 +996,28 @@ def apply_regex_filter_option(
     stdout_only: bool,
     debug_enabled: bool,
 ) -> List[Dict[str, str]]:
-    """Applique un filtre regex optionnel avec gestion des erreurs et logs."""
+    """Applique un filtre regex optionnel avec gestion uniforme des erreurs.
+
+    Cette fonction mutualise le comportement de plusieurs options CLI qui
+    partagent la meme logique: ignorer si l'option est absente, remonter une
+    erreur si la regex est invalide, et lever un echec si aucun resultat ne
+    subsiste apres filtrage.
+
+    Args:
+        rows: Lignes a filtrer.
+        pattern: Regex fournie par l'utilisateur, ou None.
+        field: Champ cible sur lequel appliquer la regex.
+        label: Libelle lisible a afficher dans les messages d'erreur.
+        stdout_only: Indique si le script doit rester silencieux hors payload.
+        debug_enabled: Indique si les logs debug sont actifs.
+
+    Returns:
+        Les lignes filtrees.
+
+    Raises:
+        ValueError: Si la regex est invalide.
+        LookupError: Si aucune ligne ne correspond au filtre demande.
+    """
     if not pattern:
         return rows
 
@@ -528,7 +1040,17 @@ def apply_regex_filter_option(
 
 
 def main() -> int:
-    """Point d'entree CLI: lit les options, extrait, filtre et exporte le CSV."""
+    """Point d'entree CLI du script.
+
+    Le flux principal suit quatre etapes:
+    1. Validation des options et gestion des modes speciaux.
+    2. Recuperation du HTML via lynx.
+    3. Parsing puis application des filtres dans un ordre deterministe.
+    4. Export final vers fichier ou MariaDB, avec affichage optionnel.
+
+    Returns:
+        0 en cas de succes, -1 en cas d'erreur fonctionnelle ou de validation.
+    """
     parser = argparse.ArgumentParser(
         description="Extrait les informations de mises a jour depuis un export HTML du Microsoft Update Catalog.",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -545,7 +1067,9 @@ def main() -> int:
             "  python3 extraction.py \"Windows Security platform\" --filter-product \"Windows Security platform\" --last --output search_last.csv --no-links\n"
             "  python3 extraction.py \"Windows Security platform\" --filter-product \"Windows Security platform\" --json --output search_filtered.json --no-links\n"
             "  python3 extraction.py \"Windows Security platform\" --filter-product \"Windows Security platform\" --last --print-results --output search_last.csv --no-links\n"
-            "  python3 extraction.py \"Windows Security platform\" --save-html search_lynx.html"
+            "  python3 extraction.py \"Windows Security platform\" --save-html search_lynx.html\n"
+            "  python3 extraction.py --output-mariadb --db-host localhost --db-port 3306 --db-user root --db-password secret --db-name catalog --db-table extraction_results --test-db-connection\n"
+            "  python3 extraction.py \"Windows Security platform\" --output-mariadb --db-host localhost --db-port 3306 --db-user root --db-password secret --db-name catalog --db-table extraction_results --no-links"
         ),
     )
     parser.add_argument("query", nargs="?", help="Texte a chercher dans le catalogue Microsoft (mode lynx)")
@@ -611,18 +1135,67 @@ def main() -> int:
         action="store_true",
         help="Afficher uniquement les resultats dans stdout (sans logs/messages)",
     )
+    parser.add_argument(
+        "--output-mariadb",
+        action="store_true",
+        help="Ecrire les resultats dans MariaDB au lieu d'un fichier CSV/JSON",
+    )
+    parser.add_argument("--db-host", help="Hote MariaDB")
+    parser.add_argument("--db-port", type=int, default=DEFAULT_DB_PORT, help="Port MariaDB (defaut: 3306)")
+    parser.add_argument("--db-user", help="Utilisateur MariaDB")
+    parser.add_argument("--db-password", help="Mot de passe MariaDB")
+    parser.add_argument("--db-name", help="Nom de la base MariaDB cible")
+    parser.add_argument("--db-table", help="Nom de la table MariaDB cible")
+    parser.add_argument("--db-charset", default="utf8mb4", help="Charset MariaDB (defaut: utf8mb4)")
+    parser.add_argument(
+        "--db-connect-timeout",
+        type=int,
+        default=10,
+        help="Timeout de connexion MariaDB en secondes (defaut: 10)",
+    )
+    parser.add_argument(
+        "--test-db-connection",
+        action="store_true",
+        help="Teste la connexion MariaDB; sans requete quitte, avec requete continue l'extraction",
+    )
     args = parser.parse_args()
+    stdout_only = args.stdout_only
 
     if args.man:
         print(MANUAL_TEXT)
         return 0
+
+    # Les options SQL sont validees le plus tot possible, y compris pour le mode test.
+    db_config = None
+    if args.output_mariadb or args.test_db_connection:
+        try:
+            db_config = build_db_config(args)
+        except ValueError as exc:
+            if not args.stdout_only:
+                print(str(exc), file=sys.stderr)
+            return -1
+
+    if args.test_db_connection:
+        try:
+            test_mariadb_connection(db_config)
+        except Exception as exc:  # noqa: BLE001
+            if not args.stdout_only:
+                print(f"Connexion MariaDB impossible: {exc}", file=sys.stderr)
+            return -1
+        if args.stdout_only:
+            print("OK")
+        else:
+            print("[*] Connexion MariaDB OK", file=sys.stderr)
+
+        # Sans requete, ce mode sert uniquement de verification de connectivite.
+        if not args.query:
+            return 0
 
     if not args.query:
         if not args.stdout_only:
             print("Argument manquant: fournir le texte de recherche en premier parametre.", file=sys.stderr)
         return -1
 
-    stdout_only = args.stdout_only
     if stdout_only:
         args.print_results = True
 
@@ -636,11 +1209,14 @@ def main() -> int:
     if not stdout_only:
         print(f"[*] Recherche via lynx: {args.query}", file=sys.stderr)
     debug_log(args.debug, "Mode recherche selectionne: lynx (obligatoire)")
+
+    # 1. Recuperation du HTML source du catalogue.
     page_html = fetch_search_html_with_lynx(args.query)
     if args.save_html:
         with open(args.save_html, "w", encoding="utf-8") as handle:
             handle.write(page_html)
 
+    # 2. Parsing HTML vers une liste de dictionnaires normalises.
     rows = parse_rows(page_html)
     debug_log(args.debug, f"Lignes parsees avant filtres: {len(rows)}")
     if not rows:
@@ -648,6 +1224,7 @@ def main() -> int:
             print("Aucune ligne de resultat detectee.", file=sys.stderr)
         return -1
 
+    # 3. Application des filtres dans un ordre fixe pour garder un comportement previsible.
     if args.filter_product:
         rows = filter_rows(rows, args.filter_product)
         if not rows:
@@ -745,14 +1322,28 @@ def main() -> int:
         debug_log(args.debug, f"Limite demandee: {args.limit}")
 
     if not args.no_links:
+        # Cette etape est volontairement tardive pour eviter des appels reseau inutiles sur des lignes deja filtrees.
         enrich_with_links(rows)
 
-    output_path = args.output
-    if args.json and output_path == DEFAULT_OUTPUT_CSV:
-        output_path = DEFAULT_OUTPUT_JSON
+    # 4. Export final vers base ou fichier.
+    destination_label = ""
+    if args.output_mariadb:
+        try:
+            write_output_to_mariadb(rows, db_config)
+        except Exception as exc:  # noqa: BLE001
+            if not stdout_only:
+                print(f"Echec export MariaDB: {exc}", file=sys.stderr)
+            return -1
+        destination_label = f"{db_config['database']}.{db_config['table']}"
+        debug_log(args.debug, f"Export MariaDB termine: {destination_label}")
+    else:
+        output_path = args.output
+        if args.json and output_path == DEFAULT_OUTPUT_CSV:
+            output_path = DEFAULT_OUTPUT_JSON
 
-    write_output(rows, args.json, output_path)
-    debug_log(args.debug, f"Fichier ecrit: {output_path}")
+        write_output(rows, args.json, output_path)
+        destination_label = output_path
+        debug_log(args.debug, f"Fichier ecrit: {output_path}")
 
     if args.print_results:
         if stdout_only:
@@ -762,7 +1353,7 @@ def main() -> int:
         debug_log(args.debug, "Affichage console des resultats termine")
 
     if not stdout_only:
-        print(f"Extraction terminee: {len(rows)} ligne(s) -> {output_path}")
+        print(f"Extraction terminee: {len(rows)} ligne(s) -> {destination_label}")
     return 0
 
 

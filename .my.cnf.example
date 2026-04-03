@@ -1,0 +1,17 @@
+# Copier ce fichier en .my.cnf pour un usage local uniquement.
+# Ne pas committer de vrais identifiants.
+# Restreindre les permissions avec: chmod 600 .my.cnf
+
+[client]
+protocol=tcp
+host=127.0.0.1
+port=3306
+user=extraction_test
+password=change_me
+database=xmppmaster
+
+[mysql]
+default-character-set=utf8mb4
+
+[mariadb]
+default-character-set=utf8mb4

@@ -1,3 +1,4 @@
+import argparse
 import tempfile
 import unittest
 import os
@@ -53,7 +54,233 @@ SAMPLE_HTML_UNSORTED_DATES = '''
 '''
 
 
+class FakeCursor:
+    def __init__(self, connection):
+        self.connection = connection
+        self._fetchall_result = []
+        self._fetchone_result = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, query, params=None):
+        self.connection.executed.append((query, params))
+        if "information_schema.COLUMNS" in query:
+            self._fetchall_result = [(column,) for column in self.connection.table_columns]
+        elif query == "SELECT 1":
+            self._fetchone_result = (1,)
+
+    def executemany(self, query, payload):
+        self.connection.executemany_calls.append((query, payload))
+
+    def fetchall(self):
+        return self._fetchall_result
+
+    def fetchone(self):
+        return self._fetchone_result
+
+
+class FakeConnection:
+    def __init__(self, table_columns=None):
+        self.table_columns = table_columns or []
+        self.executed = []
+        self.executemany_calls = []
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+
+    def cursor(self):
+        return FakeCursor(self)
+
+    def commit(self):
+        self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def close(self):
+        self.closed = True
+
+
 class ExtractionTests(unittest.TestCase):
+    def test_build_db_config_requires_all_mariadb_options(self):
+        """Verifie que la configuration MariaDB refuse les options obligatoires manquantes."""
+        args = argparse.Namespace(
+            db_host="localhost",
+            db_port=3306,
+            db_user=None,
+            db_password="secret",
+            db_name="catalog",
+            db_table="extraction_results",
+            db_charset="utf8mb4",
+            db_connect_timeout=10,
+        )
+
+        with self.assertRaisesRegex(ValueError, "--db-user"):
+            extraction.build_db_config(args)
+
+    def test_ensure_replaceable_extraction_table_rejects_unexpected_schema(self):
+        """Verifie qu'une table existante non conforme n'est pas remplacee."""
+        with mock.patch.object(extraction, "fetch_existing_table_columns", return_value=["id", "payload"]):
+            with self.assertRaisesRegex(ValueError, "schema d'extraction attendu"):
+                extraction.ensure_replaceable_extraction_table(mock.sentinel.connection, "catalog", "custom_table")
+
+    def test_write_output_to_mariadb_replaces_expected_table_and_inserts_rows(self):
+        """Verifie qu'une table d'extraction existante est recreee puis remplie."""
+        connection = FakeConnection(table_columns=list(extraction.DB_COLUMNS))
+        rows = extraction.parse_rows(SAMPLE_HTML)
+        db_config = {
+            "host": "localhost",
+            "port": 3306,
+            "user": "root",
+            "password": "secret",
+            "database": "catalog",
+            "table": "extraction_results",
+            "charset": "utf8mb4",
+            "connect_timeout": 10,
+        }
+
+        with mock.patch.object(extraction, "connect_to_mariadb", return_value=connection):
+            extraction.write_output_to_mariadb(rows, db_config)
+
+        self.assertTrue(connection.committed)
+        self.assertFalse(connection.rolled_back)
+        self.assertTrue(connection.closed)
+        executed_sql = [query for query, _ in connection.executed]
+        self.assertTrue(any(query.startswith("DROP TABLE IF EXISTS `extraction_results`") for query in executed_sql))
+        self.assertTrue(any(query.startswith("CREATE TABLE `extraction_results`") for query in executed_sql))
+        insert_query, payload = connection.executemany_calls[0]
+        self.assertIn("INSERT INTO `extraction_results`", insert_query)
+        self.assertEqual(payload[0][0], "Security Intelligence Update")
+        self.assertEqual(payload[0][6], "11111111-1111-1111-1111-111111111111")
+
+    def test_write_output_to_mariadb_refuses_non_extraction_table(self):
+        """Verifie qu'une table existante non conforme provoque une erreur et un rollback."""
+        connection = FakeConnection(table_columns=["id", "payload"])
+        rows = extraction.parse_rows(SAMPLE_HTML)
+        db_config = {
+            "host": "localhost",
+            "port": 3306,
+            "user": "root",
+            "password": "secret",
+            "database": "catalog",
+            "table": "custom_table",
+            "charset": "utf8mb4",
+            "connect_timeout": 10,
+        }
+
+        with mock.patch.object(extraction, "connect_to_mariadb", return_value=connection):
+            with self.assertRaisesRegex(ValueError, "schema d'extraction attendu"):
+                extraction.write_output_to_mariadb(rows, db_config)
+
+        self.assertFalse(connection.committed)
+        self.assertTrue(connection.rolled_back)
+        self.assertTrue(connection.closed)
+
+    def test_main_test_db_connection_succeeds_without_query(self):
+        """Verifie que le mode test de connexion MariaDB ne requiert pas de requete."""
+        argv = [
+            "extraction.py",
+            "--output-mariadb",
+            "--db-host",
+            "localhost",
+            "--db-port",
+            "3306",
+            "--db-user",
+            "root",
+            "--db-password",
+            "secret",
+            "--db-name",
+            "catalog",
+            "--db-table",
+            "extraction_results",
+            "--test-db-connection",
+        ]
+
+        with mock.patch("sys.argv", argv):
+            with mock.patch.object(extraction, "test_mariadb_connection") as mocked_test:
+                with mock.patch("sys.stderr", new_callable=StringIO) as fake_err:
+                    exit_code = extraction.main()
+
+        self.assertEqual(exit_code, 0)
+        mocked_test.assert_called_once()
+        self.assertIn("Connexion MariaDB OK", fake_err.getvalue())
+
+    def test_main_test_db_connection_with_query_continues_extraction(self):
+        """Verifie que le test de connexion peut etre utilise comme preflight avant extraction."""
+        argv = [
+            "extraction.py",
+            "Windows Security platform",
+            "--filter-product",
+            "Windows Security platform",
+            "--output-mariadb",
+            "--db-host",
+            "localhost",
+            "--db-port",
+            "3306",
+            "--db-user",
+            "root",
+            "--db-password",
+            "secret",
+            "--db-name",
+            "catalog",
+            "--db-table",
+            "extraction_results",
+            "--test-db-connection",
+            "--no-links",
+        ]
+
+        with mock.patch("sys.argv", argv):
+            with mock.patch("shutil.which", return_value="/usr/bin/lynx"):
+                with mock.patch.object(extraction, "test_mariadb_connection") as mocked_test:
+                    with mock.patch.object(extraction, "fetch_search_html_with_lynx", return_value=SAMPLE_HTML):
+                        with mock.patch.object(extraction, "write_output_to_mariadb") as mocked_write:
+                            exit_code = extraction.main()
+
+        self.assertEqual(exit_code, 0)
+        mocked_test.assert_called_once()
+        mocked_write.assert_called_once()
+
+    def test_main_output_mariadb_writes_rows(self):
+        """Teste le flux CLI avec export final vers MariaDB."""
+        argv = [
+            "extraction.py",
+            "Windows Security platform",
+            "--filter-product",
+            "Windows Security platform",
+            "--output-mariadb",
+            "--db-host",
+            "localhost",
+            "--db-port",
+            "3306",
+            "--db-user",
+            "root",
+            "--db-password",
+            "secret",
+            "--db-name",
+            "catalog",
+            "--db-table",
+            "extraction_results",
+            "--no-links",
+        ]
+
+        with mock.patch("sys.argv", argv):
+            with mock.patch("shutil.which", return_value="/usr/bin/lynx"):
+                with mock.patch.object(extraction, "fetch_search_html_with_lynx", return_value=SAMPLE_HTML):
+                    with mock.patch.object(extraction, "write_output_to_mariadb") as mocked_write:
+                        exit_code = extraction.main()
+
+        self.assertEqual(exit_code, 0)
+        mocked_write.assert_called_once()
+        rows, db_config = mocked_write.call_args.args
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["produit"], "Windows Security platform and Defender")
+        self.assertEqual(db_config["database"], "catalog")
+        self.assertEqual(db_config["table"], "extraction_results")
+
     def test_main_man_option_prints_manual(self):
         """Verifie que --man affiche le manuel detaille et quitte avec succes."""
         argv = ["extraction.py", "--man"]

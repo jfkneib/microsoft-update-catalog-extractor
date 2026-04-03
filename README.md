@@ -1,6 +1,6 @@
 # Extraction Microsoft Update Catalog
 
-Ce projet contient un script Python pour extraire les resultats du Microsoft Update Catalog et les exporter en CSV ou JSON.
+Ce projet contient un script Python pour extraire les resultats du Microsoft Update Catalog et les exporter en CSV, JSON ou MariaDB.
 
 ## Utilitaires a installer
 
@@ -20,6 +20,9 @@ Ce projet contient un script Python pour extraire les resultats du Microsoft Upd
 - sed
   Sert dans les exemples pour limiter le nombre de lignes affichees.
 
+- PyMySQL
+  Necessaire uniquement pour l'export MariaDB et le test de connexion base.
+
 ## Installation rapide
 
 Sous Debian/Ubuntu:
@@ -29,18 +32,68 @@ sudo apt update
 sudo apt install -y python3 lynx bsdextrautils sed
 ```
 
+Dependance Python optionnelle pour MariaDB:
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
 Remarque:
 
 - bsdextrautils fournit la commande column sur de nombreuses distributions Debian/Ubuntu.
 - Le script refuse l'execution si l'argument de recherche positionnel n'est pas fourni.
 - Le script refuse l'execution si lynx n'est pas installe.
+- Pour un fichier de configuration client MySQL/MariaDB, le nom standard est .my.cnf, pas .my.cf.
+
+## Fichier .my.cnf pour les tests
+
+Pour le developpement local, la pratique recommandee est la suivante:
+
+- versionner un modele sans secret;
+- garder le vrai fichier local ignore par Git;
+- utiliser un compte SQL dedie aux tests, avec des droits limites a la base de test.
+
+Un modele est fourni dans [.my.cnf.example](.my.cnf.example).
+
+Creation locale:
+
+```bash
+cp .my.cnf.example .my.cnf
+chmod 600 .my.cnf
+```
+
+Points importants:
+
+- ne jamais committer un vrai mot de passe dans .my.cnf;
+- utiliser de preference un utilisateur de test, pas root;
+- limiter ce compte a la base de test, par exemple xmppmaster si c'est votre base de validation.
+
+Exemple de test de connexion avec le client MariaDB:
+
+```bash
+mariadb --defaults-file=.my.cnf -e "SELECT 1;"
+```
+
+Exemple de verification supplementaire:
+
+```bash
+mysqladmin --defaults-file=.my.cnf ping
+```
+
+Note:
+
+- le script extraction.py ne lit pas automatiquement .my.cnf aujourd'hui;
+- ce fichier sert surtout a tester la connexion avec le client MariaDB sans repasser le mot de passe en ligne de commande;
+- une evolution possible consiste a ajouter une option du type --db-defaults-file pour que le script lise aussi ce fichier.
 
 ## Utilisation rapide
 
 1. Donner la requete de recherche en premier argument positionnel.
 2. Ajouter les filtres necessaires (produit, regex, date, UUID, limite).
 3. Choisir un fichier de sortie avec --output.
-4. Ajouter --no-links si vous voulez un traitement plus rapide.
+4. Ou choisir une sortie MariaDB avec --output-mariadb et les options de connexion.
+5. Ajouter --no-links si vous voulez un traitement plus rapide.
+6. Ajouter --test-db-connection si vous voulez verifier la connexion avant l'extraction.
 
 ## Cas concret demande
 
@@ -170,6 +223,51 @@ python3 extraction.py "Windows Security platform" \
   --no-links
 ```
 
+Tester uniquement la connexion MariaDB:
+
+```bash
+python3 extraction.py \
+  --output-mariadb \
+  --db-host 127.0.0.1 \
+  --db-port 3306 \
+  --db-user root \
+  --db-password secret \
+  --db-name catalog \
+  --db-table extraction_results \
+  --test-db-connection
+```
+
+Tester la connexion MariaDB puis poursuivre l'extraction:
+
+```bash
+python3 extraction.py "Windows Security platform" \
+  --filter-product "Windows Security platform" \
+  --output-mariadb \
+  --db-host 127.0.0.1 \
+  --db-port 3306 \
+  --db-user root \
+  --db-password secret \
+  --db-name xmppmaster \
+  --db-table extraction_results \
+  --test-db-connection \
+  --no-links
+```
+
+Exporter vers MariaDB:
+
+```bash
+python3 extraction.py "Windows Security platform" \
+  --filter-product "Windows Security platform" \
+  --output-mariadb \
+  --db-host 127.0.0.1 \
+  --db-port 3306 \
+  --db-user root \
+  --db-password secret \
+  --db-name catalog \
+  --db-table extraction_results \
+  --no-links
+```
+
 Afficher les resultats dans le terminal:
 
 ```bash
@@ -205,6 +303,12 @@ column -s, -t < search_filtered.csv | sed -n '1,20p'
 - L'option --uuid permet un filtre exact sur update_id.
 - L'option --limit permet de choisir le nombre de resultats final.
 - Les resultats sont tries par date decroissante avant l'export.
+- L'option --output-mariadb remplace la table cible si elle existe deja et si son schema correspond a la table d'extraction attendue.
+- Si la table existe avec un autre schema, le script retourne une erreur au lieu de la detruire.
+- L'option --test-db-connection permet de valider la connexion MariaDB avant tout export.
+- Si --test-db-connection est utilisee sans requete, le script quitte apres le test de connexion.
+- Si --test-db-connection est utilisee avec une requete, le script teste la connexion puis poursuit l'extraction.
+- Un fichier local .my.cnf peut etre utilise pour les tests manuels du client MariaDB, mais il n'est pas encore consomme directement par le script.
 - Les filtres regex dedies s'appliquent apres la recherche generale, sur le resultat deja extrait.
 - Les tests unitaires n'ont pas de dependance externe supplementaire.
 
