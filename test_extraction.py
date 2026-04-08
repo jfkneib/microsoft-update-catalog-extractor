@@ -14,7 +14,7 @@ import extraction
 SAMPLE_HTML = '''
 <table>
   <tr id="11111111-1111-1111-1111-111111111111_R1">
-    <td id="11111111-1111-1111-1111-111111111111_C1_R1">Security Intelligence Update</td>
+        <td id="11111111-1111-1111-1111-111111111111_C1_R1">2026-04 Cumulative Update for Windows 11 for x64-based Systems (KB5086672)</td>
     <td id="11111111-1111-1111-1111-111111111111_C2_R1">Windows Security platform and Defender</td>
     <td id="11111111-1111-1111-1111-111111111111_C3_R1">Definition Updates</td>
     <td id="11111111-1111-1111-1111-111111111111_C4_R1">2026-04-02</td>
@@ -51,6 +51,36 @@ SAMPLE_HTML_UNSORTED_DATES = '''
         <td id="bbbbbbbb-2222-2222-2222-222222222222_C6_R1">44.0 MB</td>
     </tr>
 </table>
+'''
+
+SAMPLE_DETAIL_HTML = '''
+<div id="descDiv" class="textDoubleSpacer">
+    <span id="ScopedViewHandler_labelDescription_Separator" class="labelTitle">Description:</span>
+    <span id="ScopedViewHandler_desc">Install this update to resolve issues in Windows.</span>
+</div>
+<div id="securityBullitenDiv">
+    <span id="ScopedViewHandler_labelSecurityBulliten_Separator" class="labelTitle">MSRC Number:</span>
+    n/a
+</div>
+<div id="msrcSeverityDiv">
+    <span id="ScopedViewHandler_labelMSRCSeverity_Separator" class="labelTitle">MSRC severity:</span>
+    <span id="ScopedViewHandler_msrcSeverity">n/a</span>
+</div>
+<div id="kbDiv" class="textDoubleSpacer">
+    <span id="ScopedViewHandler_labelKBArticle_Separator" class="labelTitle">KB article numbers:</span>
+    5079391
+</div>
+<div id="supersededbyInfo">
+    <div style="padding-bottom: 0.3em;">
+        <a href='ScopedViewInline.aspx?updateid=abbae10f-7521-4250-8aad-d8614ab5b66f'>2026-03 Cumulative Update for Windows 11, version 25H2 for x64-based Systems (KB5086672) (26200.8117)</a>
+    </div>
+</div>
+'''
+
+SAMPLE_DETAIL_HTML_NA_SUPERSEDED = '''
+<div id="supersededbyInfo">
+    n/a
+</div>
 '''
 
 
@@ -154,8 +184,13 @@ class ExtractionTests(unittest.TestCase):
         self.assertTrue(any(query.startswith("CREATE TABLE `extraction_results`") for query in executed_sql))
         insert_query, payload = connection.executemany_calls[0]
         self.assertIn("INSERT INTO `extraction_results`", insert_query)
-        self.assertEqual(payload[0][0], "Security Intelligence Update")
-        self.assertEqual(payload[0][6], "11111111-1111-1111-1111-111111111111")
+        self.assertEqual(payload[0][0], "2026-04 Cumulative Update for Windows 11 for x64-based Systems (KB5086672)")
+        self.assertEqual(payload[0][6], "5086672")
+        self.assertEqual(payload[0][7], "")
+        self.assertEqual(payload[0][8], "n/a")
+        self.assertEqual(payload[0][9], "n/a")
+        self.assertEqual(payload[0][10], "")
+        self.assertEqual(payload[0][11], "11111111-1111-1111-1111-111111111111")
 
     def test_write_output_to_mariadb_refuses_non_extraction_table(self):
         """Verifie qu'une table existante non conforme provoque une erreur et un rollback."""
@@ -278,8 +313,37 @@ class ExtractionTests(unittest.TestCase):
         rows, db_config = mocked_write.call_args.args
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["produit"], "Windows Security platform and Defender")
+        self.assertEqual(rows[0]["kb"], "5086672")
         self.assertEqual(db_config["database"], "catalog")
         self.assertEqual(db_config["table"], "extraction_results")
+
+    def test_extract_kb_from_title_returns_digits_only(self):
+        """Verifie que le numero KB est extrait depuis le titre sans le prefixe KB."""
+        self.assertEqual(
+            extraction.extract_kb_from_title(
+                "2026-04 Cumulative Update for Windows 11 for x64-based Systems (KB5086672)"
+            ),
+            "5086672",
+        )
+        self.assertEqual(extraction.extract_kb_from_title("Security Intelligence Update"), "")
+
+    def test_parse_update_details_html_extracts_description_msrc_and_kb(self):
+        """Verifie l'extraction des champs issus de la popup de details Microsoft."""
+        details = extraction.parse_update_details_html(SAMPLE_DETAIL_HTML)
+
+        self.assertEqual(details["description"], "Install this update to resolve issues in Windows.")
+        self.assertEqual(details["kb"], "5079391")
+        self.assertEqual(details["msrc_number"], "n/a")
+        self.assertEqual(details["msrc_severity"], "n/a")
+        self.assertEqual(
+            details["supersededby"],
+            "2026-03 Cumulative Update for Windows 11, version 25H2 for x64-based Systems (KB5086672) (26200.8117)",
+        )
+
+    def test_parse_update_details_html_maps_na_supersededby_to_empty_string(self):
+        """Verifie que la valeur n/a pour supersededby est normalisee en chaine vide."""
+        details = extraction.parse_update_details_html(SAMPLE_DETAIL_HTML_NA_SUPERSEDED)
+        self.assertEqual(details["supersededby"], "")
 
     def test_main_man_option_prints_manual(self):
         """Verifie que --man affiche le manuel detaille et quitte avec succes."""
@@ -329,7 +393,8 @@ class ExtractionTests(unittest.TestCase):
             self.assertTrue(output_path.exists())
 
             content = output_path.read_text(encoding="utf-8")
-            self.assertIn("Security Intelligence Update", content)
+            self.assertIn("2026-04 Cumulative Update for Windows 11 for x64-based Systems (KB5086672)", content)
+            self.assertIn("5086672", content)
             self.assertIn("Windows Security platform and Defender", content)
             self.assertNotIn("Other Update", content)
 
@@ -356,6 +421,93 @@ class ExtractionTests(unittest.TestCase):
 
         self.assertEqual(len(filtered), 1)
         self.assertEqual(filtered[0]["update_id"], "11111111-1111-1111-1111-111111111111")
+
+    def test_filter_rows_empty_supersededby_keeps_only_empty_values(self):
+        """Verifie que seules les lignes non remplacees sont conservees."""
+        rows = [
+            {"update_id": "1", "supersededby": ""},
+            {"update_id": "2", "supersededby": "   "},
+            {"update_id": "3", "supersededby": "KB5086672"},
+        ]
+
+        filtered = extraction.filter_rows_empty_supersededby(rows)
+
+        self.assertEqual([row["update_id"] for row in filtered], ["1", "2"])
+
+    def test_main_only_empty_supersededby_filters_out_superseded_updates(self):
+        """Verifie que l'option dediee exclut les lignes avec supersededby non vide."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "not_superseded.csv"
+            argv = [
+                "extraction.py",
+                "Windows Security platform",
+                "--only-empty-supersededby",
+                "--output",
+                str(output_path),
+                "--no-links",
+            ]
+
+            def fake_fetch_details(update_id, timeout=30):
+                if update_id == "11111111-1111-1111-1111-111111111111":
+                    return {"description": "", "kb": "5086672", "msrc_number": "n/a", "msrc_severity": "n/a", "supersededby": ""}
+                return {
+                    "description": "",
+                    "kb": "",
+                    "msrc_number": "n/a",
+                    "msrc_severity": "n/a",
+                    "supersededby": "2026-03 Cumulative Update for Windows 11 (KB5086672)",
+                }
+
+            with mock.patch("sys.argv", argv):
+                with mock.patch("shutil.which", return_value="/usr/bin/lynx"):
+                    with mock.patch.object(extraction, "fetch_search_html_with_lynx", return_value=SAMPLE_HTML):
+                        with mock.patch.object(extraction, "fetch_update_details", side_effect=fake_fetch_details):
+                            exit_code = extraction.main()
+
+            content = output_path.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("2026-04 Cumulative Update for Windows 11 for x64-based Systems (KB5086672)", content)
+        self.assertNotIn("Other Update", content)
+
+    def test_main_filter_regex_on_supersededby_auto_loads_details(self):
+        """Verifie qu'un filtre regex sur supersededby charge les details avant filtrage."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "supersededby_filtered.csv"
+            argv = [
+                "extraction.py",
+                "Windows Security platform",
+                "--filter-regex",
+                "^$",
+                "--filter-field",
+                "supersededby",
+                "--output",
+                str(output_path),
+                "--no-links",
+            ]
+
+            def fake_fetch_details(update_id, timeout=30):
+                if update_id == "11111111-1111-1111-1111-111111111111":
+                    return {"description": "", "kb": "5086672", "msrc_number": "n/a", "msrc_severity": "n/a", "supersededby": ""}
+                return {
+                    "description": "",
+                    "kb": "",
+                    "msrc_number": "n/a",
+                    "msrc_severity": "n/a",
+                    "supersededby": "2026-03 Cumulative Update for Windows 11 (KB5086672)",
+                }
+
+            with mock.patch("sys.argv", argv):
+                with mock.patch("shutil.which", return_value="/usr/bin/lynx"):
+                    with mock.patch.object(extraction, "fetch_search_html_with_lynx", return_value=SAMPLE_HTML):
+                        with mock.patch.object(extraction, "fetch_update_details", side_effect=fake_fetch_details):
+                            exit_code = extraction.main()
+
+            content = output_path.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("2026-04 Cumulative Update for Windows 11 for x64-based Systems (KB5086672)", content)
+        self.assertNotIn("Other Update", content)
 
     def test_select_latest_row(self):
         """Verifie la selection de la ligne la plus recente sur la date catalogue."""
@@ -426,7 +578,7 @@ class ExtractionTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             content = output_path.read_text(encoding="utf-8")
-            self.assertIn("Security Intelligence Update", content)
+            self.assertIn("2026-04 Cumulative Update for Windows 11 for x64-based Systems (KB5086672)", content)
             self.assertNotIn("Other Update", content)
 
     def test_main_search_with_last_keeps_only_latest(self):
@@ -503,7 +655,7 @@ class ExtractionTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             content = output_path.read_text(encoding="utf-8")
-            self.assertIn("Security Intelligence Update", content)
+            self.assertIn("2026-04 Cumulative Update for Windows 11 for x64-based Systems (KB5086672)", content)
             self.assertNotIn("Other Update", content)
 
     def test_main_search_with_title_regex_filters_rows(self):
@@ -514,7 +666,7 @@ class ExtractionTests(unittest.TestCase):
                 "extraction.py",
                 "Windows Security platform",
                 "--title-regex",
-                "Security Intelligence",
+                "Cumulative Update",
                 "--output",
                 str(output_path),
                 "--no-links",
@@ -527,7 +679,7 @@ class ExtractionTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             content = output_path.read_text(encoding="utf-8")
-            self.assertIn("Security Intelligence Update", content)
+            self.assertIn("Cumulative Update for Windows 11", content)
             self.assertNotIn("Other Update", content)
 
     def test_main_search_with_classification_regex_filters_rows(self):
@@ -551,7 +703,7 @@ class ExtractionTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             content = output_path.read_text(encoding="utf-8")
-            self.assertIn("Security Intelligence Update", content)
+            self.assertIn("Cumulative Update for Windows 11", content)
             self.assertNotIn("Other Update", content)
 
     def test_main_search_with_uuid_regex_filters_rows(self):
@@ -800,6 +952,63 @@ class ExtractionTests(unittest.TestCase):
             self.assertIn("Windows Security platform and Defender", out)
             self.assertNotIn("--- RESULTATS ---", out)
             self.assertNotIn("Extraction terminee", out)
+
+    def test_main_stdout_only_without_output_does_not_write_file(self):
+        """Verifie que --stdout-only n'ecrit aucun fichier meme sans --output."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            argv = [
+                "extraction.py",
+                "Windows Security platform",
+                "--filter-product",
+                "Windows Security platform",
+                "--stdout-only",
+                "--json",
+                "--no-links",
+            ]
+
+            with mock.patch("sys.argv", argv):
+                with mock.patch("shutil.which", return_value="/usr/bin/lynx"):
+                    with mock.patch.object(extraction, "fetch_search_html_with_lynx", return_value=SAMPLE_HTML):
+                        with mock.patch("sys.stdout", new_callable=StringIO) as fake_out:
+                            with mock.patch("sys.stderr", new_callable=StringIO) as fake_err:
+                                previous_cwd = os.getcwd()
+                                os.chdir(tmpdir)
+                                try:
+                                    exit_code = extraction.main()
+                                finally:
+                                    os.chdir(previous_cwd)
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(fake_err.getvalue(), "")
+            self.assertIn('"titre": "2026-04 Cumulative Update for Windows 11 for x64-based Systems (KB5086672)"', fake_out.getvalue())
+            self.assertIn('"kb": "5086672"', fake_out.getvalue())
+            self.assertFalse((Path(tmpdir) / "catalog_windows_security_platform.json").exists())
+
+    def test_main_default_output_uses_current_directory(self):
+        """Verifie que l'absence de --output ecrit dans le repertoire courant."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            argv = [
+                "extraction.py",
+                "Windows Security platform",
+                "--filter-product",
+                "Windows Security platform",
+                "--no-links",
+            ]
+
+            with mock.patch("sys.argv", argv):
+                with mock.patch("shutil.which", return_value="/usr/bin/lynx"):
+                    with mock.patch.object(extraction, "fetch_search_html_with_lynx", return_value=SAMPLE_HTML):
+                        previous_cwd = os.getcwd()
+                        os.chdir(tmpdir)
+                        try:
+                            exit_code = extraction.main()
+                        finally:
+                            os.chdir(previous_cwd)
+
+            self.assertEqual(exit_code, 0)
+            output_path = Path(tmpdir) / "catalog_windows_security_platform.csv"
+            self.assertTrue(output_path.exists())
+            self.assertIn("Windows Security platform and Defender", output_path.read_text(encoding="utf-8"))
 
     def test_main_invalid_regex_returns_minus_one(self):
         """Verifie qu'une regex invalide retourne -1."""

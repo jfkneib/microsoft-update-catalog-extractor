@@ -2,6 +2,18 @@
 
 Ce projet contient un script Python pour extraire les resultats du Microsoft Update Catalog et les exporter en CSV, JSON ou MariaDB.
 
+Les exports incluent egalement une colonne `kb`, derivee du titre lorsqu'un motif du type `KB5086672` est present.
+Le script peut aussi enrichir les resultats avec la fiche detail Microsoft pour recuperer :
+
+- `description`
+- `msrc_number`
+- `msrc_severity`
+- `supersededby`
+
+Une option `--only-empty-supersededby` permet de conserver uniquement les mises a jour dont `supersededby` est vide, donc celles qui ne sont pas deja remplacees. Cette option active implicitement la lecture de la fiche detail Microsoft.
+
+Pour `supersededby`, une valeur affichee comme `n/a` dans la fiche detail est normalisee en chaine vide dans les exports.
+
 ## Utilitaires a installer
 
 ### Obligatoires
@@ -116,6 +128,7 @@ Exemple d'export vers une base MySQL/MariaDB:
 ```bash
 python3 extraction.py "Windows Security platform" \
   --filter-product "Windows Security platform" \
+  --with-details \
   --output-mariadb \
   --db-host 127.0.0.1 \
   --db-port 3306 \
@@ -139,9 +152,12 @@ mysql -h 127.0.0.1 -P 3306 -u extraction_test -p -D xmppmaster -e "SELECT update
 1. Donner la requete de recherche en premier argument positionnel.
 2. Ajouter les filtres necessaires (produit, regex, date, UUID, limite).
 3. Choisir un fichier de sortie avec --output.
+  Si --output est absent, le script cree par defaut catalog_windows_security_platform.csv ou .json dans le repertoire courant.
 4. Ou choisir une sortie MariaDB avec --output-mariadb et les options de connexion.
-5. Ajouter --no-links si vous voulez un traitement plus rapide.
-6. Ajouter --test-db-connection si vous voulez verifier la connexion avant l'extraction.
+5. Ajouter --with-details si vous voulez enrichir les lignes avec `description`, `msrc_number` et `msrc_severity`.
+6. Ajouter --only-empty-supersededby si vous voulez exclure les mises a jour deja remplacees.
+7. Ajouter --no-links si vous voulez un traitement plus rapide.
+8. Ajouter --test-db-connection si vous voulez verifier la connexion avant l'extraction.
 
 ## Cas concret demande
 
@@ -158,6 +174,7 @@ Commande:
 python3 extraction.py "Cumulative Update for Windows 11 Version 24H2 for x64-based Systems" \
   --filter-product "Windows 11" \
   --classification-regex "^updates$" \
+  --with-details \
   --limit 4 \
   --output windows11_24h2_top4.csv \
   --no-links
@@ -168,8 +185,8 @@ python3 extraction.py "Cumulative Update for Windows 11 Version 24H2 for x64-bas
 Recherche avec filtre produit:
 
 ```bash
-python3 extraction.py "Windows Security platform" \
-  --filter-product "Windows Security platform" \
+python3 extraction.py "Cumulative Update for Windows 11, version 25H2 for x64-based" \
+  --filter-product "Windows 11" \
   --output search_filtered.csv \
   --no-links
 ```
@@ -199,6 +216,16 @@ Filtrer la classification avec une regex (insensible a la casse):
 python3 extraction.py "Windows Security platform" \
   --classification-regex "definition updates|security updates" \
   --output class_filtered.csv \
+  --no-links
+```
+
+Conserver uniquement les mises a jour non remplacees:
+
+```bash
+python3 extraction.py "Windows Security platform" \
+  --filter-product "Windows Security platform" \
+  --only-empty-supersededby \
+  --output not_superseded.csv \
   --no-links
 ```
 

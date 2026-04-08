@@ -16,6 +16,7 @@ import html
 import importlib
 import io
 import json
+import os
 import re
 import shutil
 import sys
@@ -26,6 +27,7 @@ from typing import Any, Dict, List
 
 SEARCH_URL = "https://www.catalog.update.microsoft.com/Search.aspx"
 DOWNLOAD_DIALOG_URL = "https://www.catalog.update.microsoft.com/DownloadDialog.aspx"
+DETAILS_URL = "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx"
 DEFAULT_OUTPUT_CSV = "/home/jfk/catalog_windows_security_platform.csv"
 DEFAULT_OUTPUT_JSON = "/home/jfk/catalog_windows_security_platform.json"
 DEFAULT_DB_PORT = 3306
@@ -36,9 +38,15 @@ DB_COLUMNS = [
     "derniere_mise_a_jour",
     "version",
     "taille",
+    "kb",
+    "description",
+    "msrc_number",
+    "msrc_severity",
+    "supersededby",
     "update_id",
     "lien_telechargement",
 ]
+DETAIL_ENRICHED_FIELDS = {"description", "msrc_number", "msrc_severity", "supersededby"}
 
 
 MANUAL_TEXT = """\
@@ -57,6 +65,11 @@ DESCRIPTION
         - derniere_mise_a_jour
         - version
         - taille
+        - kb
+        - description
+        - msrc_number
+        - msrc_severity
+        - supersededby
         - update_id
         - lien_telechargement
 
@@ -96,7 +109,7 @@ FILTRES
 
     --filter-field CHAMP
         Choisit le champ cible de --filter-regex.
-        Valeurs: titre, produit, classification, derniere_mise_a_jour, version, taille, update_id
+        Valeurs: titre, produit, classification, derniere_mise_a_jour, version, taille, kb, description, msrc_number, msrc_severity, supersededby, update_id
 
     --title-regex "REGEX"
         Filtre le champ titre avec une expression reguliere.
@@ -145,6 +158,14 @@ SORTIE
 
     --no-links
         N'appelle pas DownloadDialog.aspx (plus rapide, colonne lien vide).
+
+    --with-details
+        Interroge la fiche detail de chaque mise a jour pour recuperer la
+        description, le numero MSRC, la severite MSRC et confirmer le KB.
+
+    --only-empty-supersededby
+        Conserve uniquement les mises a jour dont le champ supersededby est
+        vide. Cette option active implicitement la lecture de la fiche detail.
 
     --save-html fichier.html
         Sauvegarde le HTML recupere.
@@ -250,6 +271,12 @@ EXEMPLES
                                  --output-mariadb --db-host localhost --db-port 3306 \
                                  --db-user root --db-password secret --db-name catalog \
                                  --db-table extraction_results --no-links
+
+                     16) Conserver uniquement les mises a jour non remplacees
+                             python3 extraction.py "Windows 11" \
+                                 --filter-product "Windows 11" \
+                                 --only-empty-supersededby \
+                                 --output not_superseded.csv --no-links
 """
 
 
@@ -287,6 +314,127 @@ def clean_text(raw: str) -> str:
     text = html.unescape(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def extract_kb_from_title(title: str) -> str:
+    """Extrait le numero KB depuis le titre quand il est present.
+
+    Le catalogue affiche souvent le KB directement dans le titre, par exemple
+    sous la forme "(KB5086672)". Pour simplifier les exports et les filtres,
+    on normalise cette information dans une colonne dediee et on ne conserve
+    que la partie numerique.
+
+    Args:
+        title: Titre d'une mise a jour issu du catalogue.
+
+    Returns:
+        Le numero KB sans prefixe "KB", ou une chaine vide si aucun motif
+        exploitable n'est present dans le titre.
+    """
+    match = re.search(r"\bKB\s*([0-9]{6,8})\b", title or "", re.I)
+    if not match:
+        return ""
+    return match.group(1)
+
+
+def fetch_update_details_html(update_id: str, timeout: int = 30) -> str:
+    """Recupere la fiche detail HTML d'une mise a jour via ScopedViewInline.
+
+    Args:
+        update_id: UUID de la mise a jour.
+        timeout: Timeout HTTP en secondes.
+
+    Returns:
+        Le HTML de la fiche detail.
+    """
+    params = urllib.parse.urlencode({"updateid": update_id})
+    req = urllib.request.Request(
+        f"{DETAILS_URL}?{params}",
+        headers={"User-Agent": "Mozilla/5.0"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+
+def parse_update_details_html(detail_html: str) -> Dict[str, str]:
+    """Extrait les metadonnees utiles depuis la fiche detail d'une mise a jour.
+
+    Args:
+        detail_html: HTML de la fiche detail ScopedViewInline.
+
+    Returns:
+        Dictionnaire contenant description, kb, msrc_number et msrc_severity.
+    """
+
+    def extract_element_text(element_id: str) -> str:
+        match = re.search(
+            rf'id="{re.escape(element_id)}"[^>]*>(.*?)</[^>]+>',
+            detail_html,
+            re.S | re.I,
+        )
+        return clean_text(match.group(1)) if match else ""
+
+    def extract_div_text(div_id: str, label: str) -> str:
+        match = re.search(
+            rf'<div id="{re.escape(div_id)}"[^>]*>(.*?)</div>',
+            detail_html,
+            re.S | re.I,
+        )
+        if not match:
+            return ""
+        text = clean_text(match.group(1))
+        text = re.sub(rf'^{re.escape(label)}\s*', '', text, flags=re.I).strip()
+        return text
+
+    def extract_div_items(div_id: str) -> str:
+        match = re.search(
+            rf'<div id="{re.escape(div_id)}"[^>]*>(.*?)</div>',
+            detail_html,
+            re.S | re.I,
+        )
+        if not match:
+            return ""
+        block = match.group(1)
+        items = re.findall(r'<div[^>]*>(.*?)</div>', block, re.S | re.I)
+        if not items:
+            text = clean_text(block)
+            return "" if text.lower() == "n/a" else text
+        cleaned_items = []
+        for item in items:
+            text = clean_text(item)
+            if text and text.lower() != "n/a":
+                cleaned_items.append(text)
+        return " | ".join(cleaned_items)
+
+    description = extract_element_text("ScopedViewHandler_desc")
+    msrc_severity = extract_element_text("ScopedViewHandler_msrcSeverity") or "n/a"
+    msrc_number = extract_div_text("securityBullitenDiv", "MSRC Number:") or "n/a"
+    kb_text = extract_div_text("kbDiv", "KB article numbers:")
+    kb_match = re.search(r'\b([0-9]{6,8})\b', kb_text)
+    kb = kb_match.group(1) if kb_match else ""
+    supersededby = extract_div_items("supersededbyInfo")
+
+    return {
+        "description": description,
+        "kb": kb,
+        "msrc_number": msrc_number,
+        "msrc_severity": msrc_severity,
+        "supersededby": "" if supersededby.lower() == "n/a" else supersededby,
+    }
+
+
+def fetch_update_details(update_id: str, timeout: int = 30) -> Dict[str, str]:
+    """Recupere et parse la fiche detail d'une mise a jour.
+
+    Args:
+        update_id: UUID de la mise a jour.
+        timeout: Timeout HTTP en secondes.
+
+    Returns:
+        Metadonnees detaillees de la mise a jour.
+    """
+    return parse_update_details_html(fetch_update_details_html(update_id, timeout=timeout))
 
 
 def parse_rows(page_html: str) -> List[Dict[str, str]]:
@@ -346,6 +494,11 @@ def parse_rows(page_html: str) -> List[Dict[str, str]]:
             "version": extract_cell(uid, 5, row_html),
             "taille": clean_text(size_m.group(1)) if size_m else extract_cell(uid, 6, row_html),
         }
+        record["kb"] = extract_kb_from_title(record["titre"])
+        record["description"] = ""
+        record["msrc_number"] = "n/a"
+        record["msrc_severity"] = "n/a"
+        record["supersededby"] = ""
 
         if record["titre"]:
             rows.append(record)
@@ -514,6 +667,21 @@ def filter_rows_uuid(rows: List[Dict[str, str]], uuid_value: str) -> List[Dict[s
     return [r for r in rows if (r.get("update_id", "") or "").strip().lower() == needle]
 
 
+def filter_rows_empty_supersededby(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """Conserve uniquement les lignes dont supersededby est vide.
+
+    Cette fonction est utile pour ne garder que les mises a jour qui ne sont
+    pas deja remplacees par une autre entree du catalogue.
+
+    Args:
+        rows: Lignes candidates a filtrer.
+
+    Returns:
+        Les lignes dont le champ supersededby est vide ou ne contient que des espaces.
+    """
+    return [r for r in rows if not (r.get("supersededby", "") or "").strip()]
+
+
 def parse_catalog_date(raw_date: str) -> datetime.date:
     """Convertit une date du catalogue en objet date Python.
 
@@ -646,6 +814,37 @@ def enrich_with_links(rows: List[Dict[str, str]]) -> None:
             )
 
 
+def enrich_with_details(rows: List[Dict[str, str]]) -> None:
+    """Ajoute les metadonnees de la fiche detail a chaque ligne.
+
+    Cette etape effectue un appel supplementaire par mise a jour vers la popup
+    de details du catalogue. En cas d'echec, les valeurs par defaut sont
+    conservees pour ne pas perdre la ligne principale.
+
+    Args:
+        rows: Lignes a enrichir. La liste est modifiee en place.
+    """
+    for row in rows:
+        try:
+            details = fetch_update_details(row["update_id"])
+            row["description"] = details.get("description", "") or ""
+            row["msrc_number"] = details.get("msrc_number", "n/a") or "n/a"
+            row["msrc_severity"] = details.get("msrc_severity", "n/a") or "n/a"
+            row["supersededby"] = details.get("supersededby", "") or ""
+            detail_kb = details.get("kb", "") or ""
+            if detail_kb:
+                row["kb"] = detail_kb
+        except Exception as exc:  # noqa: BLE001
+            row.setdefault("description", "")
+            row.setdefault("msrc_number", "n/a")
+            row.setdefault("msrc_severity", "n/a")
+            row.setdefault("supersededby", "")
+            print(
+                f"[WARN] Echec de recuperation des details pour {row['update_id']}: {exc}",
+                file=sys.stderr,
+            )
+
+
 def write_csv(rows: List[Dict[str, str]], output_path: str) -> None:
     """Ecrit les resultats dans un fichier CSV.
 
@@ -742,6 +941,26 @@ def write_output(rows: List[Dict[str, str]], as_json: bool, output_path: str) ->
         write_json(rows, output_path)
     else:
         write_csv(rows, output_path)
+
+
+def resolve_output_path(raw_output: str | None, as_json: bool) -> str:
+    """Construit le chemin de sortie final.
+
+    Si aucun chemin n'est fourni, le fichier par defaut est cree dans le
+    repertoire courant afin d'eviter toute hypothese sur l'environnement.
+
+    Args:
+        raw_output: Valeur de l'option --output, ou None si absente.
+        as_json: Indique si la sortie doit etre en JSON.
+
+    Returns:
+        Le chemin final a utiliser pour l'ecriture.
+    """
+    if raw_output:
+        return raw_output
+
+    filename = os.path.basename(DEFAULT_OUTPUT_JSON if as_json else DEFAULT_OUTPUT_CSV)
+    return os.path.join(os.getcwd(), filename)
 
 
 def sanitize_sql_identifier(identifier: str, label: str) -> str:
@@ -934,6 +1153,11 @@ def recreate_extraction_table(connection: Any, table_name: str) -> None:
         "`derniere_mise_a_jour` VARCHAR(32) NOT NULL, "
         "`version` VARCHAR(255) NOT NULL, "
         "`taille` VARCHAR(255) NOT NULL, "
+        "`kb` VARCHAR(16) NOT NULL, "
+        "`description` TEXT NOT NULL, "
+        "`msrc_number` VARCHAR(64) NOT NULL, "
+        "`msrc_severity` VARCHAR(64) NOT NULL, "
+        "`supersededby` TEXT NOT NULL, "
         "`update_id` VARCHAR(64) NOT NULL, "
         "`lien_telechargement` TEXT NOT NULL, "
         "PRIMARY KEY (`update_id`)"
@@ -955,8 +1179,8 @@ def insert_rows_into_mariadb(connection: Any, table_name: str, rows: List[Dict[s
     """
     insert_sql = (
         f"INSERT INTO `{table_name}` ("
-        "titre, produit, classification, derniere_mise_a_jour, version, taille, update_id, lien_telechargement"
-        ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
+        "titre, produit, classification, derniere_mise_a_jour, version, taille, kb, description, msrc_number, msrc_severity, supersededby, update_id, lien_telechargement"
+        ") VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
     )
     # La charge utile respecte exactement l'ordre defini dans DB_COLUMNS et dans le CREATE TABLE.
     payload = [tuple((row.get(column, "") or "") for column in DB_COLUMNS) for row in rows]
@@ -1066,6 +1290,7 @@ def main() -> int:
             "  python3 extraction.py \"Windows Security platform\" --filter-product \"Windows Security platform\" --limit 5 --output top5.csv --no-links\n"
             "  python3 extraction.py \"Windows Security platform\" --filter-product \"Windows Security platform\" --last --output search_last.csv --no-links\n"
             "  python3 extraction.py \"Windows Security platform\" --filter-product \"Windows Security platform\" --json --output search_filtered.json --no-links\n"
+            "  python3 extraction.py \"Windows Security platform\" --filter-product \"Windows Security platform\" --only-empty-supersededby --output not_superseded.csv --no-links\n"
             "  python3 extraction.py \"Windows Security platform\" --filter-product \"Windows Security platform\" --last --print-results --output search_last.csv --no-links\n"
             "  python3 extraction.py \"Windows Security platform\" --save-html search_lynx.html\n"
             "  python3 extraction.py --output-mariadb --db-host localhost --db-port 3306 --db-user root --db-password secret --db-name catalog --db-table extraction_results --test-db-connection\n"
@@ -1084,7 +1309,7 @@ def main() -> int:
     parser.add_argument(
         "--filter-field",
         default="produit",
-        choices=["titre", "produit", "classification", "derniere_mise_a_jour", "version", "taille", "update_id"],
+        choices=["titre", "produit", "classification", "derniere_mise_a_jour", "version", "taille", "kb", "description", "msrc_number", "msrc_severity", "supersededby", "update_id"],
         help="Champ cible pour --filter-regex (defaut: produit)",
     )
     parser.add_argument(
@@ -1104,7 +1329,7 @@ def main() -> int:
         type=int,
         help="Nombre maximum de lignes a conserver apres tri et filtres",
     )
-    parser.add_argument("--output", default=DEFAULT_OUTPUT_CSV, help="Chemin du fichier de sortie (CSV ou JSON)")
+    parser.add_argument("--output", help="Chemin du fichier de sortie (CSV ou JSON); par defaut: repertoire courant")
     parser.add_argument(
         "--save-html",
         help="Chemin de sauvegarde du HTML recupere en mode lynx",
@@ -1113,6 +1338,16 @@ def main() -> int:
         "--no-links",
         action="store_true",
         help="Ne pas appeler DownloadDialog.aspx (plus rapide, sans lien direct)",
+    )
+    parser.add_argument(
+        "--with-details",
+        action="store_true",
+        help="Interroger la fiche detail de chaque mise a jour pour enrichir kb, description et metadonnees MSRC",
+    )
+    parser.add_argument(
+        "--only-empty-supersededby",
+        action="store_true",
+        help="Garder uniquement les mises a jour dont supersededby est vide; active implicitement les details",
     )
     parser.add_argument(
         "--last",
@@ -1224,6 +1459,9 @@ def main() -> int:
             print("Aucune ligne de resultat detectee.", file=sys.stderr)
         return -1
 
+    filter_regex_on_detail_field = bool(args.filter_regex and args.filter_field in DETAIL_ENRICHED_FIELDS)
+    details_loaded = False
+
     # 3. Application des filtres dans un ordre fixe pour garder un comportement previsible.
     if args.filter_product:
         rows = filter_rows(rows, args.filter_product)
@@ -1235,7 +1473,7 @@ def main() -> int:
             print(f"[*] Filtre applique: {len(rows)} ligne(s) conservee(s)", file=sys.stderr)
         debug_log(args.debug, f"Filtre produit applique avec motif: {args.filter_product}")
 
-    if args.filter_regex:
+    if args.filter_regex and not filter_regex_on_detail_field:
         try:
             rows = apply_regex_filter_option(
                 rows,
@@ -1291,6 +1529,37 @@ def main() -> int:
             print(f"[*] Filtre de date applique: {len(rows)} ligne(s) conservee(s)", file=sys.stderr)
         debug_log(args.debug, f"Filtre date applique: from={args.fromdate}, to={args.todate}")
 
+    if filter_regex_on_detail_field or args.only_empty_supersededby:
+        enrich_with_details(rows)
+        details_loaded = True
+        debug_log(args.debug, "Enrichissement detail active avant filtrage sur champs detail")
+
+    if args.filter_regex and filter_regex_on_detail_field:
+        try:
+            rows = apply_regex_filter_option(
+                rows,
+                args.filter_regex,
+                args.filter_field,
+                f"le champ '{args.filter_field}'",
+                stdout_only,
+                args.debug,
+            )
+        except (ValueError, LookupError):
+            return -1
+
+    if args.only_empty_supersededby:
+        rows = filter_rows_empty_supersededby(rows)
+        if not rows:
+            if not stdout_only:
+                print("Aucune ligne ne correspond a un supersededby vide.", file=sys.stderr)
+            return -1
+        if not stdout_only:
+            print(
+                f"[*] Filtre supersededby vide applique: {len(rows)} ligne(s) conservee(s)",
+                file=sys.stderr,
+            )
+        debug_log(args.debug, "Filtre supersededby vide applique")
+
     if args.last:
         rows = select_latest_row(rows)
         if not rows:
@@ -1321,6 +1590,11 @@ def main() -> int:
             print(f"[*] Limite appliquee: {len(rows)} ligne(s) conservee(s)", file=sys.stderr)
         debug_log(args.debug, f"Limite demandee: {args.limit}")
 
+    if args.with_details and not details_loaded:
+        enrich_with_details(rows)
+        details_loaded = True
+        debug_log(args.debug, "Enrichissement via les fiches detail termine")
+
     if not args.no_links:
         # Cette etape est volontairement tardive pour eviter des appels reseau inutiles sur des lignes deja filtrees.
         enrich_with_links(rows)
@@ -1337,13 +1611,15 @@ def main() -> int:
         destination_label = f"{db_config['database']}.{db_config['table']}"
         debug_log(args.debug, f"Export MariaDB termine: {destination_label}")
     else:
-        output_path = args.output
-        if args.json and output_path == DEFAULT_OUTPUT_CSV:
-            output_path = DEFAULT_OUTPUT_JSON
+        output_path = resolve_output_path(args.output, args.json)
 
-        write_output(rows, args.json, output_path)
-        destination_label = output_path
-        debug_log(args.debug, f"Fichier ecrit: {output_path}")
+        if stdout_only:
+            destination_label = "stdout"
+            debug_log(args.debug, "Mode stdout-only: aucune ecriture fichier")
+        else:
+            write_output(rows, args.json, output_path)
+            destination_label = output_path
+            debug_log(args.debug, f"Fichier ecrit: {output_path}")
 
     if args.print_results:
         if stdout_only:
