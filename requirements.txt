@@ -1,1 +1,12 @@
+# Dependances Python de ce projet.
+#
+# Le script n'utilise que la bibliotheque standard Python, sauf pour
+# l'export MariaDB / MySQL qui repose aujourd'hui sur PyMySQL.
+#
+# Dependance active par defaut pour --output-mariadb et --test-db-connection.
 PyMySQL>=1.1,<2
+#
+# Alternative possible si vous voulez porter extraction.py sur MySQLdb :
+# mysqlclient>=2.2,<3
+#
+# Important : lynx est un prerequis systeme, pas une dependance pip.

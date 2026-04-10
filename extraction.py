@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import sys
 import urllib.parse
 import urllib.request
@@ -31,6 +32,7 @@ DETAILS_URL = "https://www.catalog.update.microsoft.com/ScopedViewInline.aspx"
 DEFAULT_OUTPUT_CSV = "/home/jfk/catalog_windows_security_platform.csv"
 DEFAULT_OUTPUT_JSON = "/home/jfk/catalog_windows_security_platform.json"
 DEFAULT_DB_PORT = 3306
+DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 DB_COLUMNS = [
     "titre",
     "produit",
@@ -169,6 +171,10 @@ SORTIE
 
     --save-html fichier.html
         Sauvegarde le HTML recupere.
+
+    --accept-language LANGUES
+        Force la langue preferee du catalogue et des fiches detail.
+        Defaut: en-US,en;q=0.9.
 
     --output-mariadb
         Ecrit les resultats dans une table MariaDB au lieu d'un fichier.
@@ -350,7 +356,7 @@ def fetch_update_details_html(update_id: str, timeout: int = 30) -> str:
     params = urllib.parse.urlencode({"updateid": update_id})
     req = urllib.request.Request(
         f"{DETAILS_URL}?{params}",
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers=build_request_headers(DEFAULT_ACCEPT_LANGUAGE),
         method="GET",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -424,17 +430,26 @@ def parse_update_details_html(detail_html: str) -> Dict[str, str]:
     }
 
 
-def fetch_update_details(update_id: str, timeout: int = 30) -> Dict[str, str]:
+def fetch_update_details(update_id: str, timeout: int = 30, accept_language: str = DEFAULT_ACCEPT_LANGUAGE) -> Dict[str, str]:
     """Recupere et parse la fiche detail d'une mise a jour.
 
     Args:
         update_id: UUID de la mise a jour.
         timeout: Timeout HTTP en secondes.
+        accept_language: Langue preferee a imposer a la fiche detail.
 
     Returns:
         Metadonnees detaillees de la mise a jour.
     """
-    return parse_update_details_html(fetch_update_details_html(update_id, timeout=timeout))
+    params = urllib.parse.urlencode({"updateid": update_id})
+    req = urllib.request.Request(
+        f"{DETAILS_URL}?{params}",
+        headers=build_request_headers(accept_language),
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        detail_html = resp.read().decode("utf-8", errors="ignore")
+    return parse_update_details_html(detail_html)
 
 
 def parse_rows(page_html: str) -> List[Dict[str, str]]:
@@ -506,7 +521,71 @@ def parse_rows(page_html: str) -> List[Dict[str, str]]:
     return rows
 
 
-def fetch_search_html(query: str, timeout: int = 30) -> str:
+def build_request_headers(accept_language: str) -> Dict[str, str]:
+    """Construit les en-tetes HTTP utilises pour stabiliser les reponses.
+
+    Args:
+        accept_language: Valeur envoyee dans l'en-tete Accept-Language.
+
+    Returns:
+        Dictionnaire d'en-tetes HTTP a reutiliser pour urllib.
+    """
+    return {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": accept_language,
+    }
+
+
+def normalize_lynx_preferred_language(accept_language: str) -> str:
+    """Convertit Accept-Language au format attendu par lynx.cfg.
+
+    Args:
+        accept_language: Valeur brute du header HTTP Accept-Language.
+
+    Returns:
+        Liste de langues sans poids q=, adaptee a PREFERRED_LANGUAGE.
+    """
+    languages: List[str] = []
+    for item in accept_language.split(","):
+        language = item.split(";", 1)[0].strip()
+        if language:
+            languages.append(language)
+    return ",".join(languages) or "en"
+
+
+def create_lynx_cfg_with_language(preferred_language: str) -> str | None:
+    """Cree un fichier lynx.cfg temporaire avec une langue stable.
+
+    Args:
+        preferred_language: Valeur a injecter dans PREFERRED_LANGUAGE.
+
+    Returns:
+        Chemin du fichier temporaire, ou None si le cfg systeme est absent.
+    """
+    default_cfg_path = "/etc/lynx/lynx.cfg"
+    if not os.path.exists(default_cfg_path):
+        return None
+
+    with open(default_cfg_path, "r", encoding="utf-8", errors="ignore") as handle:
+        config_text = handle.read()
+
+    if re.search(r"^PREFERRED_LANGUAGE:.*$", config_text, flags=re.M):
+        config_text = re.sub(
+            r"^PREFERRED_LANGUAGE:.*$",
+            f"PREFERRED_LANGUAGE:{preferred_language}",
+            config_text,
+            count=1,
+            flags=re.M,
+        )
+    else:
+        config_text += f"\nPREFERRED_LANGUAGE:{preferred_language}\n"
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".cfg") as handle:
+        handle.write(config_text)
+        return handle.name
+
+
+def fetch_search_html(query: str, timeout: int = 30, accept_language: str = DEFAULT_ACCEPT_LANGUAGE) -> str:
     """Telecharge la page de recherche via HTTP direct.
 
     Cette fonction existe surtout comme alternative simple pour le debug ou des
@@ -516,6 +595,7 @@ def fetch_search_html(query: str, timeout: int = 30) -> str:
     Args:
         query: Texte recherche dans le catalogue.
         timeout: Timeout HTTP en secondes.
+        accept_language: Langue preferee a imposer a la page de recherche.
 
     Returns:
         Le HTML de la page de recherche.
@@ -524,14 +604,14 @@ def fetch_search_html(query: str, timeout: int = 30) -> str:
     url = f"{SEARCH_URL}?{params}"
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers=build_request_headers(accept_language),
         method="GET",
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="ignore")
 
 
-def fetch_search_html_with_lynx(query: str, timeout: int = 30) -> str:
+def fetch_search_html_with_lynx(query: str, timeout: int = 30, accept_language: str = DEFAULT_ACCEPT_LANGUAGE) -> str:
     """Telecharge la page de recherche en utilisant lynx.
 
     Le site Microsoft Update Catalog repond de maniere plus stable pour ce
@@ -541,6 +621,7 @@ def fetch_search_html_with_lynx(query: str, timeout: int = 30) -> str:
     Args:
         query: Texte recherche dans le catalogue.
         timeout: Timeout de l'appel subprocess en secondes.
+        accept_language: Langue preferee a imposer via la configuration lynx.
 
     Returns:
         Le HTML brut renvoye par lynx.
@@ -553,18 +634,27 @@ def fetch_search_html_with_lynx(query: str, timeout: int = 30) -> str:
     # Lynx permet une extraction plus proche du rendu attendu par le site.
     params = urllib.parse.urlencode({"q": query})
     url = f"{SEARCH_URL}?{params}"
-    result = subprocess.run(
-        ["lynx", "-source", url],
-        capture_output=True,
-        timeout=timeout,
-        text=True,
-    )
+    cfg_path = create_lynx_cfg_with_language(normalize_lynx_preferred_language(accept_language))
+    command = ["lynx"]
+    if cfg_path:
+        command.append(f"-cfg={cfg_path}")
+    command.extend(["-source", url])
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=timeout,
+            text=True,
+        )
+    finally:
+        if cfg_path and os.path.exists(cfg_path):
+            os.unlink(cfg_path)
     if result.returncode != 0:
         raise RuntimeError(f"lynx failed: {result.stderr}")
     return result.stdout
 
 
-def fetch_download_link(update_id: str, timeout: int = 30) -> str:
+def fetch_download_link(update_id: str, timeout: int = 30, accept_language: str = DEFAULT_ACCEPT_LANGUAGE) -> str:
     """Recupere le premier lien de telechargement direct pour une mise a jour.
 
     Le catalogue expose les liens de telechargement via DownloadDialog.aspx.
@@ -574,6 +664,7 @@ def fetch_download_link(update_id: str, timeout: int = 30) -> str:
     Args:
         update_id: UUID de la mise a jour.
         timeout: Timeout HTTP en secondes.
+        accept_language: Langue preferee a imposer au dialogue de telechargement.
 
     Returns:
         La premiere URL de telechargement trouvee, ou une chaine vide.
@@ -607,8 +698,8 @@ def fetch_download_link(update_id: str, timeout: int = 30) -> str:
         data=body,
         method="POST",
         headers={
+            **build_request_headers(accept_language),
             "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Mozilla/5.0",
         },
     )
 
@@ -793,7 +884,7 @@ def sort_rows_by_date_desc(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return [row for _, row in dated_rows] + undated_rows
 
 
-def enrich_with_links(rows: List[Dict[str, str]]) -> None:
+def enrich_with_links(rows: List[Dict[str, str]], accept_language: str = DEFAULT_ACCEPT_LANGUAGE) -> None:
     """Ajoute un lien de telechargement direct a chaque ligne.
 
     Cette etape effectue un appel supplementaire par mise a jour. Elle est donc
@@ -801,10 +892,11 @@ def enrich_with_links(rows: List[Dict[str, str]]) -> None:
 
     Args:
         rows: Lignes a enrichir. La liste est modifiee en place.
+        accept_language: Langue preferee a imposer pour les liens directs.
     """
     for row in rows:
         try:
-            row["lien_telechargement"] = fetch_download_link(row["update_id"])
+            row["lien_telechargement"] = fetch_download_link(row["update_id"], accept_language=accept_language)
         except Exception as exc:  # noqa: BLE001
             # On conserve la ligne meme si la resolution du lien echoue.
             row["lien_telechargement"] = ""
@@ -814,7 +906,7 @@ def enrich_with_links(rows: List[Dict[str, str]]) -> None:
             )
 
 
-def enrich_with_details(rows: List[Dict[str, str]]) -> None:
+def enrich_with_details(rows: List[Dict[str, str]], accept_language: str = DEFAULT_ACCEPT_LANGUAGE) -> None:
     """Ajoute les metadonnees de la fiche detail a chaque ligne.
 
     Cette etape effectue un appel supplementaire par mise a jour vers la popup
@@ -823,10 +915,11 @@ def enrich_with_details(rows: List[Dict[str, str]]) -> None:
 
     Args:
         rows: Lignes a enrichir. La liste est modifiee en place.
+        accept_language: Langue preferee a imposer pour les fiches detail.
     """
     for row in rows:
         try:
-            details = fetch_update_details(row["update_id"])
+            details = fetch_update_details(row["update_id"], accept_language=accept_language)
             row["description"] = details.get("description", "") or ""
             row["msrc_number"] = details.get("msrc_number", "n/a") or "n/a"
             row["msrc_severity"] = details.get("msrc_severity", "n/a") or "n/a"
@@ -1335,6 +1428,11 @@ def main() -> int:
         help="Chemin de sauvegarde du HTML recupere en mode lynx",
     )
     parser.add_argument(
+        "--accept-language",
+        default=DEFAULT_ACCEPT_LANGUAGE,
+        help="Langue preferee a imposer au catalogue et aux fiches detail (defaut: en-US,en;q=0.9)",
+    )
+    parser.add_argument(
         "--no-links",
         action="store_true",
         help="Ne pas appeler DownloadDialog.aspx (plus rapide, sans lien direct)",
@@ -1439,14 +1537,15 @@ def main() -> int:
             print("Prerequis manquant: 'lynx' n'est pas installe sur le systeme.", file=sys.stderr)
         return -1
 
-    debug_log(args.debug, f"Options: json={args.json}, last={args.last}, no_links={args.no_links}")
+    debug_log(args.debug, f"Options: json={args.json}, last={args.last}, no_links={args.no_links}, accept_language={args.accept_language}")
 
     if not stdout_only:
         print(f"[*] Recherche via lynx: {args.query}", file=sys.stderr)
+        print(f"[*] Langue forcee: {args.accept_language}", file=sys.stderr)
     debug_log(args.debug, "Mode recherche selectionne: lynx (obligatoire)")
 
     # 1. Recuperation du HTML source du catalogue.
-    page_html = fetch_search_html_with_lynx(args.query)
+    page_html = fetch_search_html_with_lynx(args.query, accept_language=args.accept_language)
     if args.save_html:
         with open(args.save_html, "w", encoding="utf-8") as handle:
             handle.write(page_html)
@@ -1530,7 +1629,7 @@ def main() -> int:
         debug_log(args.debug, f"Filtre date applique: from={args.fromdate}, to={args.todate}")
 
     if filter_regex_on_detail_field or args.only_empty_supersededby:
-        enrich_with_details(rows)
+        enrich_with_details(rows, accept_language=args.accept_language)
         details_loaded = True
         debug_log(args.debug, "Enrichissement detail active avant filtrage sur champs detail")
 
@@ -1591,13 +1690,13 @@ def main() -> int:
         debug_log(args.debug, f"Limite demandee: {args.limit}")
 
     if args.with_details and not details_loaded:
-        enrich_with_details(rows)
+        enrich_with_details(rows, accept_language=args.accept_language)
         details_loaded = True
         debug_log(args.debug, "Enrichissement via les fiches detail termine")
 
     if not args.no_links:
         # Cette etape est volontairement tardive pour eviter des appels reseau inutiles sur des lignes deja filtrees.
-        enrich_with_links(rows)
+        enrich_with_links(rows, accept_language=args.accept_language)
 
     # 4. Export final vers base ou fichier.
     destination_label = ""

@@ -14,6 +14,40 @@ Une option `--only-empty-supersededby` permet de conserver uniquement les mises 
 
 Pour `supersededby`, une valeur affichee comme `n/a` dans la fiche detail est normalisee en chaine vide dans les exports.
 
+Par defaut, le script force une preference de langue stable en anglais via `Accept-Language: en-US,en;q=0.9`, y compris pour la recherche, la fiche detail et le dialogue de telechargement.
+
+## Lecture d'une ligne exportee
+
+Chaque ligne exportee par `extraction.py` represente une mise a jour vue dans le Microsoft Update Catalog, avec quelques enrichissements optionnels.
+
+- `titre` : titre affiche dans le resultat de recherche Microsoft.
+- `produit` : produit cible associe a la mise a jour.
+- `classification` : classification textuelle retournee par le catalogue.
+- `derniere_mise_a_jour` : date brute telle qu'affichee par le site Microsoft. Elle reste textuelle pour coller a la source.
+- `version` : version visible dans le catalogue.
+- `taille` : taille affichee dans le catalogue, conservee sous forme textuelle.
+- `kb` : numero KB derive du titre, puis confirme par la fiche detail si celle-ci est lue.
+- `description` : description issue de la fiche detail. Vide si `--with-details` n'est pas utilise ou si Microsoft ne fournit pas de texte.
+- `msrc_number` : reference MSRC issue de la fiche detail. Vide si absente.
+- `msrc_severity` : severite MSRC issue de la fiche detail. Vide si absente.
+- `supersededby` : libelle de remplacement tel qu'affiche dans la fiche detail. Ce champ contient un titre catalogue, pas un identifiant WSUS.
+- `update_id` : UUID Microsoft de la mise a jour. C'est l'identifiant le plus precis dans les exports de l'outil.
+- `lien_telechargement` : URL directe du package si le script interroge `DownloadDialog.aspx`. Vide avec `--no-links` ou si le lien n'a pas pu etre resolu.
+
+Points importants :
+
+- `update_id` est plus precis qu'un `kb` pour distinguer deux publications proches.
+- `supersededby` n'est pas directement reutilisable comme cle WSUS, car le catalogue HTML expose surtout un titre humain.
+- `derniere_mise_a_jour` doit etre interpretee comme une date catalogue, pas comme une revision WSUS.
+
+## Limites importantes
+
+- Le script n'extrait pas de `revisionid` ni de `revisionnumber` WSUS, car ces informations ne sont pas exposees dans les pages HTML du Microsoft Update Catalog utilisees ici.
+- Le champ `supersededby` est un libelle catalogue. Il ne fournit pas directement une cle exploitable pour reconstruire une relation WSUS fiable.
+- Le champ `lien_telechargement` correspond a l'URL directe recuperee via `DownloadDialog.aspx`. C'est utile pour telecharger un package, mais ce n'est pas un identifiant metier stable.
+- Le parsing depend de la structure HTML actuelle du catalogue et du rendu fourni par `lynx`. Si Microsoft change cette structure, le script peut devoir etre adapte.
+- La langue de reponse peut faire varier les libelles retournes par le site. Le script force donc l'anglais par defaut pour stabiliser l'extraction.
+
 ## Utilitaires a installer
 
 ### Obligatoires
@@ -35,6 +69,8 @@ Pour `supersededby`, une valeur affichee comme `n/a` dans la fiche detail est no
 - PyMySQL
   Necessaire uniquement pour l'export MariaDB et le test de connexion base.
 
+Le code actuel utilise explicitement `PyMySQL`. `MySQLdb` n'est donc pas supporte tel quel aujourd'hui.
+
 ## Installation rapide
 
 Sous Debian/Ubuntu:
@@ -50,12 +86,63 @@ Dependance Python optionnelle pour MariaDB:
 python3 -m pip install -r requirements.txt
 ```
 
+Alternative si vous voulez utiliser `MySQLdb` a la place de `PyMySQL`:
+
+```bash
+python3 -m pip install mysqlclient
+```
+
 Remarque:
 
 - bsdextrautils fournit la commande column sur de nombreuses distributions Debian/Ubuntu.
 - Le script refuse l'execution si l'argument de recherche positionnel n'est pas fourni.
 - Le script refuse l'execution si lynx n'est pas installe.
 - Pour un fichier de configuration client MySQL/MariaDB, le nom standard est .my.cnf, pas .my.cf.
+
+## Utiliser MySQLdb a la place de PyMySQL
+
+Si vous voulez basculer `extraction.py` sur `MySQLdb`, il faut prevoir un petit ajustement de code. Installer la bibliotheque ne suffit pas a elle seule.
+
+Ce qu'il faut changer dans le code :
+
+- dans `load_mariadb_client()`, importer `MySQLdb` au lieu de `pymysql` ;
+- dans `connect_to_mariadb()`, remplacer l'argument `password=` par `passwd=` ;
+- dans `connect_to_mariadb()`, remplacer l'argument `database=` par `db=` ;
+- eviter de supposer que `autocommit=False` est accepte comme argument de connexion ; le plus robuste est d'ouvrir la connexion puis d'appeler `connection.autocommit(False)` ;
+- mettre a jour le message d'erreur et la documentation d'installation pour demander `mysqlclient` au lieu de `PyMySQL`.
+
+Exemple d'adaptation minimale :
+
+```python
+def load_mariadb_client() -> Any:
+  try:
+    return importlib.import_module("MySQLdb")
+  except ImportError as exc:
+    raise RuntimeError(
+      "Module Python manquant pour MariaDB: installez mysqlclient (pip install mysqlclient)."
+    ) from exc
+
+
+def connect_to_mariadb(db_config: Dict[str, Any]) -> Any:
+  client = load_mariadb_client()
+  connection = client.connect(
+    host=db_config["host"],
+    port=db_config["port"],
+    user=db_config["user"],
+    passwd=db_config["password"],
+    db=db_config["database"],
+    charset=db_config["charset"],
+    connect_timeout=db_config["connect_timeout"],
+  )
+  connection.autocommit(False)
+  return connection
+```
+
+Recommendation pratique :
+
+- gardez `PyMySQL` si vous voulez la solution la plus simple et la plus portable pour ce projet ;
+- utilisez `MySQLdb` seulement si vous avez deja une contrainte d'environnement ou de performance qui l'impose ;
+- si vous voulez supporter les deux bibliotheques, faites un chargement avec repli : essayer `pymysql`, puis `MySQLdb`.
 
 ## Fichier .my.cnf pour les tests
 
@@ -158,6 +245,42 @@ mysql -h 127.0.0.1 -P 3306 -u extraction_test -p -D xmppmaster -e "SELECT update
 6. Ajouter --only-empty-supersededby si vous voulez exclure les mises a jour deja remplacees.
 7. Ajouter --no-links si vous voulez un traitement plus rapide.
 8. Ajouter --test-db-connection si vous voulez verifier la connexion avant l'extraction.
+9. Laisser `--accept-language` sur sa valeur par defaut si vous voulez des resultats reproductibles.
+
+## Cout reseau et impact des options
+
+Toutes les options n'ont pas le meme cout.
+
+- la recherche principale fait une requete catalogue via `lynx` ;
+- `--with-details` ajoute jusqu'a une requete HTTP de detail par ligne conservee ;
+- `--only-empty-supersededby` active implicitement les details, donc le meme surcout ;
+- `--no-links` evite les appels a `DownloadDialog.aspx`, donc peut reduire fortement la duree totale ;
+- un `--filter-regex` sur `description`, `msrc_number`, `msrc_severity` ou `supersededby` force lui aussi le chargement des details avant filtrage.
+- `--accept-language` permet de figer explicitement la langue retournee par le catalogue.
+
+## Langue et reproductibilite
+
+Vous ne vous trompez pas : interroger le catalogue en francais ou en anglais peut produire des differences visibles.
+
+- les libelles textuels comme `classification`, `supersededby` ou certains champs de detail peuvent etre localises ;
+- un filtre textuel applique apres extraction peut donc matcher differemment selon la langue retournee ;
+- le parser des fiches detail est historiquement concu pour des libelles anglais ;
+- la requete de recherche elle-meme peut aussi renvoyer autre chose si vous changez la langue du texte recherche.
+
+Pour cette raison, le script force l'anglais par defaut. Si vous devez tester un autre contexte, vous pouvez surcharger la langue :
+
+```bash
+python3 extraction.py "Windows Security platform" \
+  --accept-language fr-FR,fr;q=0.9 \
+  --output search_filtered.csv \
+  --no-links
+```
+
+En pratique :
+
+- pour un tri rapide ou exploratoire, commencer par `--no-links` sans details ;
+- n'activer les details que si vous avez besoin des champs MSRC, de la description ou du filtrage sur `supersededby` ;
+- n'activer les liens directs que si vous avez besoin du telechargement effectif.
 
 ## Cas concret demande
 
@@ -386,6 +509,20 @@ column -s, -t < search_filtered.csv | sed -n '1,20p'
 - Un fichier local .my.cnf peut etre utilise pour les tests manuels du client MariaDB, mais il n'est pas encore consomme directement par le script.
 - Les filtres regex dedies s'appliquent apres la recherche generale, sur le resultat deja extrait.
 - Les tests unitaires n'ont pas de dependance externe supplementaire.
+
+## Codes de retour
+
+- succes : code 0 ;
+- erreur fonctionnelle ou de validation : le script retourne `-1` en interne, ce qui apparait generalement comme un code shell `255`.
+
+Cas typiques d'erreur :
+
+- argument de recherche manquant ;
+- `lynx` absent ;
+- regex invalide ;
+- aucun resultat apres filtrage ;
+- echec de connexion MariaDB ;
+- table SQL existante avec un schema different du schema d'extraction attendu.
 
 ## Tests
 
